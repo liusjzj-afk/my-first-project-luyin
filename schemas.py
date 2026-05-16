@@ -19,8 +19,14 @@ class MeetingStatusResponse(BaseModel):
     title: str
     upload_time: datetime | None = None
     duration_seconds: int | None = None
+    audio_duration: int | None = None
+    eta_seconds: int | None = None
+    progress_percent: int | None = None
+    audio_url: str | None = None
     transcript: list[dict[str, Any]] | None = None
     summary_markdown: str | None = None
+    summary_content: str | None = None
+    ia_content: str | None = None
     error: str | None = None
 
 
@@ -30,6 +36,9 @@ class MeetingListItem(BaseModel):
     upload_time: datetime
     asr_status: str
     duration_seconds: int
+    audio_duration: int
+    eta_seconds: int | None = None
+    progress_percent: int | None = None
     deleted_at: datetime | None = None
 
 

@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_base_url: str | None = None
     llm_model: str = "gpt-4o-mini"
+    meeting_agent_prompt_path: Path = Path("./meeting_agent_prompt.md")
 
     # 阿里云 ASR/OSS 环境变量在 services/asr_service.py 中读取：
     # ALIYUN_AK, ALIYUN_SK, ALIYUN_APPKEY, ALIYUN_REGION_ID,

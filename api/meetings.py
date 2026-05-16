@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import shutil
 import uuid
+from datetime import datetime, timezone
+from mimetypes import guess_type
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi.responses import FileResponse
+from mutagen import File as MutagenFile
 from sqlalchemy.orm import Session
 
 from config import get_settings
@@ -22,12 +26,12 @@ from schemas import (
     UploadMeetingResponse,
 )
 from services.asr_service import ASRServiceError, AliyunASRService
-from services.llm_service import LLMService, LLMServiceError
+from services.llm_service import LLMService, LLMServiceError, strip_model_thinking
 
 
 router = APIRouter(prefix="/api/meetings", tags=["meetings"])
 
-ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a"}
+ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".mp4", ".aac", ".opus"}
 
 
 def get_db():
@@ -63,11 +67,15 @@ def get_meeting_stats(db: Session = Depends(get_db)) -> MeetingStatsResponse:
 
     active_meetings = db.query(Meeting).filter(Meeting.deleted_at.is_(None)).all()
     trash_count = db.query(Meeting).filter(Meeting.deleted_at.is_not(None)).count()
-    used_seconds = sum(max(0, meeting.duration_seconds or 0) for meeting in active_meetings)
+    used_seconds = sum(max(0, meeting.audio_duration or meeting.duration_seconds or 0) for meeting in active_meetings)
     return MeetingStatsResponse(
         used_minutes=(used_seconds + 59) // 60,
         meeting_count=len(active_meetings),
-        processing_count=sum(1 for meeting in active_meetings if meeting.asr_status == ASRStatus.PROCESSING),
+        processing_count=sum(
+            1
+            for meeting in active_meetings
+            if meeting.asr_status in {ASRStatus.PROCESSING, ASRStatus.SUMMARIZING}
+        ),
         trash_count=trash_count,
     )
 
@@ -83,7 +91,7 @@ def upload_meeting_audio(
     if suffix not in ALLOWED_AUDIO_EXTENSIONS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="仅支持 .mp3、.wav、.m4a 音频文件",
+            detail="仅支持 .mp3、.wav、.m4a、.mp4、.aac、.opus 音频文件",
         )
 
     settings = get_settings()
@@ -105,6 +113,8 @@ def upload_meeting_audio(
             detail=f"音频文件不能超过 {settings.max_upload_size_mb} MB",
         )
 
+    audio_duration = _get_audio_duration_seconds(audio_path)
+
     try:
         asr_service = AliyunASRService()
         audio_url = asr_service.upload_audio_to_oss(
@@ -125,6 +135,8 @@ def upload_meeting_audio(
         audio_file_path=str(audio_path),
         asr_task_id=task_id,
         asr_status=ASRStatus.PROCESSING,
+        audio_duration=audio_duration,
+        duration_seconds=audio_duration,
     )
     db.add(meeting)
     db.commit()
@@ -150,21 +162,34 @@ def get_meeting_status(
             if task_status == "COMPLETED":
                 transcript = asr_service.normalize_transcript(result)
                 meeting.transcript_json = transcript
-                meeting.duration_seconds = _extract_duration_seconds(result, transcript)
-                meeting.asr_status = ASRStatus.COMPLETED
+                detected_duration = _extract_duration_seconds(result, transcript)
+                meeting.duration_seconds = detected_duration or meeting.audio_duration or 0
+                meeting.audio_duration = meeting.audio_duration or detected_duration
+                meeting.asr_status = ASRStatus.SUMMARIZING
+                db.commit()
+                db.refresh(meeting)
                 try:
-                    meeting.summary_markdown = _generate_summary_safely(transcript)
+                    summary_sections = _generate_summary_safely(transcript)
+                    meeting.summary_content = summary_sections["summary_content"]
+                    meeting.ia_content = summary_sections["ia_content"]
+                    meeting.summary_markdown = summary_sections["raw_content"]
+                    meeting.asr_status = ASRStatus.COMPLETED
                 except Exception as exc:  # LLM 失败不应阻断逐字稿展示。
-                    meeting.summary_markdown = (
+                    failure_summary = (
                         "## 需求纪要生成失败\n\n"
                         f"{str(exc)}\n\n"
                         "逐字稿已保存，可在修复 LLM 配置或额度后重新生成。"
                     )
+                    meeting.summary_content = failure_summary
+                    meeting.ia_content = ""
+                    meeting.summary_markdown = failure_summary
+                    meeting.asr_status = ASRStatus.COMPLETED
                 db.commit()
                 db.refresh(meeting)
             elif task_status == "FAILED":
                 meeting.asr_status = ASRStatus.FAILED
-                meeting.duration_seconds = _extract_duration_seconds(result, meeting.transcript_json or [])
+                detected_duration = _extract_duration_seconds(result, meeting.transcript_json or [])
+                meeting.duration_seconds = detected_duration or meeting.audio_duration or 0
                 db.commit()
                 db.refresh(meeting)
                 return _status_response(
@@ -177,7 +202,49 @@ def get_meeting_status(
             db.refresh(meeting)
             return _status_response(meeting, error=str(exc))
 
+    if meeting.asr_status == ASRStatus.SUMMARIZING and meeting.transcript_json and not meeting.summary_content:
+        try:
+            summary_sections = _generate_summary_safely(meeting.transcript_json)
+            meeting.summary_content = summary_sections["summary_content"]
+            meeting.ia_content = summary_sections["ia_content"]
+            meeting.summary_markdown = summary_sections["raw_content"]
+            meeting.asr_status = ASRStatus.COMPLETED
+            db.commit()
+            db.refresh(meeting)
+        except Exception as exc:
+            failure_summary = (
+                "## 需求纪要生成失败\n\n"
+                f"{str(exc)}\n\n"
+                "逐字稿已保存，可在修复 LLM 配置或额度后重新生成。"
+            )
+            meeting.summary_content = failure_summary
+            meeting.ia_content = ""
+            meeting.summary_markdown = failure_summary
+            meeting.asr_status = ASRStatus.COMPLETED
+            db.commit()
+            db.refresh(meeting)
+
     return _status_response(meeting)
+
+
+@router.get("/{meeting_id}/audio")
+def get_meeting_audio(
+    meeting_id: str,
+    db: Session = Depends(get_db),
+) -> FileResponse:
+    """返回会议本地录音文件，供详情页播放器使用。"""
+
+    meeting = _get_meeting_or_404(db, meeting_id)
+    audio_path = Path(meeting.audio_file_path)
+    if not audio_path.exists() or not audio_path.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="录音文件不存在")
+
+    media_type = guess_type(audio_path.name)[0] or "application/octet-stream"
+    return FileResponse(
+        path=audio_path,
+        media_type=media_type,
+        headers={"Content-Disposition": f'inline; filename="{audio_path.name}"'},
+    )
 
 
 @router.delete("/{meeting_id}", response_model=ActionResponse)
@@ -255,7 +322,9 @@ def chat_with_meeting_agent(
         llm_service = LLMService()
         reply = llm_service.answer_meeting_question(
             transcript=meeting.transcript_json,
-            summary_markdown=meeting.summary_markdown,
+            summary_markdown=strip_model_thinking(
+                meeting.summary_content or meeting.summary_markdown or ""
+            ),
             history=history,
             user_message=payload.message,
         )
@@ -323,7 +392,59 @@ def _extract_duration_seconds(result: dict[str, Any], transcript: list[dict[str,
     return max(0, (max_end_time + 999) // 1000)
 
 
-def _generate_summary_safely(transcript: list[dict[str, Any]]) -> str:
+def _get_audio_duration_seconds(audio_path: Path) -> int:
+    """使用 mutagen 读取本地音频真实时长，失败时返回 0。"""
+
+    try:
+        audio = MutagenFile(str(audio_path))
+        if audio and audio.info and audio.info.length:
+            return max(1, int(round(float(audio.info.length))))
+    except Exception:
+        return 0
+    return 0
+
+
+def _eta_seconds(meeting: Meeting) -> int | None:
+    """根据音频时长和已等待时间估算 ASR 剩余秒数。"""
+
+    if meeting.asr_status != ASRStatus.PROCESSING:
+        return None
+    audio_duration = meeting.audio_duration or meeting.duration_seconds or 0
+    if audio_duration <= 0:
+        return None
+
+    upload_time = meeting.upload_time
+    if upload_time.tzinfo is None:
+        upload_time = upload_time.replace(tzinfo=timezone.utc)
+    waited_seconds = max(0, int((datetime.now(timezone.utc) - upload_time).total_seconds()))
+    estimated_total = max(1, int(audio_duration * 0.3))
+    return max(1, estimated_total - waited_seconds)
+
+
+def _progress_percent(meeting: Meeting) -> int:
+    """为前端列表提供近似进度，不代表阿里云真实进度。"""
+
+    if meeting.asr_status == ASRStatus.COMPLETED:
+        return 100
+    if meeting.asr_status == ASRStatus.FAILED:
+        return 100
+    if meeting.asr_status == ASRStatus.SUMMARIZING:
+        return 92
+    if meeting.asr_status == ASRStatus.PENDING:
+        return 5
+
+    audio_duration = meeting.audio_duration or meeting.duration_seconds or 0
+    if audio_duration <= 0:
+        return 35
+    upload_time = meeting.upload_time
+    if upload_time.tzinfo is None:
+        upload_time = upload_time.replace(tzinfo=timezone.utc)
+    waited_seconds = max(0, int((datetime.now(timezone.utc) - upload_time).total_seconds()))
+    estimated_total = max(1, int(audio_duration * 0.3))
+    return min(90, max(10, int(waited_seconds / estimated_total * 90)))
+
+
+def _generate_summary_safely(transcript: list[dict[str, Any]]) -> dict[str, str]:
     """ASR 完成后立即触发 LLM 总结。"""
 
     llm_service = LLMService()
@@ -337,8 +458,16 @@ def _status_response(meeting: Meeting, error: str | None = None) -> MeetingStatu
         title=meeting.title,
         upload_time=meeting.upload_time,
         duration_seconds=meeting.duration_seconds or 0,
+        audio_duration=meeting.audio_duration or meeting.duration_seconds or 0,
+        eta_seconds=_eta_seconds(meeting),
+        progress_percent=_progress_percent(meeting),
+        audio_url=f"/api/meetings/{meeting.id}/audio" if meeting.audio_file_path else None,
         transcript=meeting.transcript_json,
-        summary_markdown=meeting.summary_markdown,
+        summary_markdown=strip_model_thinking(meeting.summary_markdown or "") or None,
+        summary_content=strip_model_thinking(
+            meeting.summary_content or meeting.summary_markdown or ""
+        ) or None,
+        ia_content=strip_model_thinking(meeting.ia_content or "") or None,
         error=error,
     )
 
@@ -350,5 +479,8 @@ def _meeting_list_item(meeting: Meeting) -> MeetingListItem:
         upload_time=meeting.upload_time,
         asr_status=meeting.asr_status.value,
         duration_seconds=meeting.duration_seconds or 0,
+        audio_duration=meeting.audio_duration or meeting.duration_seconds or 0,
+        eta_seconds=_eta_seconds(meeting),
+        progress_percent=_progress_percent(meeting),
         deleted_at=meeting.deleted_at,
     )

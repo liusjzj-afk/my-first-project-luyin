@@ -47,7 +47,8 @@ def main() -> None:
         ]
     )
     print("LLM_OK")
-    print(summary[:800])
+    print(summary["summary_content"][:800])
+    print(summary["ia_content"][:800])
 
 
 if __name__ == "__main__":

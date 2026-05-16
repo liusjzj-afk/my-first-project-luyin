@@ -37,6 +37,7 @@ class ASRStatus(str, enum.Enum):
 
     PENDING = "PENDING"
     PROCESSING = "PROCESSING"
+    SUMMARIZING = "SUMMARIZING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
 
@@ -92,6 +93,12 @@ class Meeting(Base):
         default=0,
         comment="会议音频时长，单位秒",
     )
+    audio_duration: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        default=0,
+        comment="原始音频真实时长，单位秒",
+    )
     deleted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,
@@ -106,6 +113,16 @@ class Meeting(Base):
         Text,
         nullable=True,
         comment="LLM 生成的系统需求 Markdown 纪要",
+    )
+    summary_content: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="LLM 生成的需求分析 Markdown 内容",
+    )
+    ia_content: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="LLM 生成的信息架构与优先级 Markdown 内容",
     )
 
     chat_histories: Mapped[list["ChatHistory"]] = relationship(
@@ -187,5 +204,11 @@ def ensure_schema() -> None:
         }
         if "duration_seconds" not in columns:
             connection.execute(text("ALTER TABLE meetings ADD COLUMN duration_seconds INTEGER DEFAULT 0"))
+        if "audio_duration" not in columns:
+            connection.execute(text("ALTER TABLE meetings ADD COLUMN audio_duration INTEGER DEFAULT 0"))
         if "deleted_at" not in columns:
             connection.execute(text("ALTER TABLE meetings ADD COLUMN deleted_at DATETIME"))
+        if "summary_content" not in columns:
+            connection.execute(text("ALTER TABLE meetings ADD COLUMN summary_content TEXT"))
+        if "ia_content" not in columns:
+            connection.execute(text("ALTER TABLE meetings ADD COLUMN ia_content TEXT"))
