@@ -11,7 +11,7 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, Text, create_engine
+from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, Text, create_engine, text
 from sqlalchemy.dialects.sqlite import JSON
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
@@ -86,6 +86,17 @@ class Meeting(Base):
         default=ASRStatus.PENDING,
         comment="ASR 任务状态",
     )
+    duration_seconds: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        default=0,
+        comment="会议音频时长，单位秒",
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="软删除时间，非空表示进入回收站",
+    )
     transcript_json: Mapped[list[dict] | None] = mapped_column(
         JSON,
         nullable=True,
@@ -159,3 +170,22 @@ def init_db() -> None:
     """创建数据库表。后续可在 FastAPI 启动事件中调用。"""
 
     Base.metadata.create_all(bind=engine)
+
+
+def ensure_schema() -> None:
+    """
+    创建表并补齐本地 SQLite 轻量 schema 变更。
+
+    项目当前不引入 Alembic；对已有本地数据库只追加兼容字段。
+    """
+
+    Base.metadata.create_all(bind=engine)
+    with engine.begin() as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(text("PRAGMA table_info(meetings)")).fetchall()
+        }
+        if "duration_seconds" not in columns:
+            connection.execute(text("ALTER TABLE meetings ADD COLUMN duration_seconds INTEGER DEFAULT 0"))
+        if "deleted_at" not in columns:
+            connection.execute(text("ALTER TABLE meetings ADD COLUMN deleted_at DATETIME"))

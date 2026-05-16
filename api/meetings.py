@@ -7,12 +7,20 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from sqlalchemy.orm import Session
 
 from config import get_settings
-from models import ASRStatus, ChatHistory, ChatRole, Meeting, SessionLocal
-from schemas import ChatRequest, ChatResponse, MeetingStatusResponse, UploadMeetingResponse
+from models import ASRStatus, ChatHistory, ChatRole, Meeting, SessionLocal, utc_now
+from schemas import (
+    ActionResponse,
+    ChatRequest,
+    ChatResponse,
+    MeetingListItem,
+    MeetingStatsResponse,
+    MeetingStatusResponse,
+    UploadMeetingResponse,
+)
 from services.asr_service import ASRServiceError, AliyunASRService
 from services.llm_service import LLMService, LLMServiceError
 
@@ -30,6 +38,38 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+@router.get("", response_model=list[MeetingListItem])
+def list_meetings(
+    trash: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> list[MeetingListItem]:
+    """返回我的内容或回收站列表。"""
+
+    query = db.query(Meeting)
+    if trash:
+        query = query.filter(Meeting.deleted_at.is_not(None))
+    else:
+        query = query.filter(Meeting.deleted_at.is_(None))
+
+    meetings = query.order_by(Meeting.upload_time.desc()).all()
+    return [_meeting_list_item(meeting) for meeting in meetings]
+
+
+@router.get("/stats", response_model=MeetingStatsResponse)
+def get_meeting_stats(db: Session = Depends(get_db)) -> MeetingStatsResponse:
+    """返回列表页需要的已用分钟和记录统计。"""
+
+    active_meetings = db.query(Meeting).filter(Meeting.deleted_at.is_(None)).all()
+    trash_count = db.query(Meeting).filter(Meeting.deleted_at.is_not(None)).count()
+    used_seconds = sum(max(0, meeting.duration_seconds or 0) for meeting in active_meetings)
+    return MeetingStatsResponse(
+        used_minutes=(used_seconds + 59) // 60,
+        meeting_count=len(active_meetings),
+        processing_count=sum(1 for meeting in active_meetings if meeting.asr_status == ASRStatus.PROCESSING),
+        trash_count=trash_count,
+    )
 
 
 @router.post("/upload", response_model=UploadMeetingResponse)
@@ -110,12 +150,21 @@ def get_meeting_status(
             if task_status == "COMPLETED":
                 transcript = asr_service.normalize_transcript(result)
                 meeting.transcript_json = transcript
-                meeting.summary_markdown = _generate_summary_safely(transcript)
+                meeting.duration_seconds = _extract_duration_seconds(result, transcript)
                 meeting.asr_status = ASRStatus.COMPLETED
+                try:
+                    meeting.summary_markdown = _generate_summary_safely(transcript)
+                except Exception as exc:  # LLM 失败不应阻断逐字稿展示。
+                    meeting.summary_markdown = (
+                        "## 需求纪要生成失败\n\n"
+                        f"{str(exc)}\n\n"
+                        "逐字稿已保存，可在修复 LLM 配置或额度后重新生成。"
+                    )
                 db.commit()
                 db.refresh(meeting)
             elif task_status == "FAILED":
                 meeting.asr_status = ASRStatus.FAILED
+                meeting.duration_seconds = _extract_duration_seconds(result, meeting.transcript_json or [])
                 db.commit()
                 db.refresh(meeting)
                 return _status_response(
@@ -129,6 +178,50 @@ def get_meeting_status(
             return _status_response(meeting, error=str(exc))
 
     return _status_response(meeting)
+
+
+@router.delete("/{meeting_id}", response_model=ActionResponse)
+def delete_meeting(
+    meeting_id: str,
+    db: Session = Depends(get_db),
+) -> ActionResponse:
+    """软删除会议，移入回收站。"""
+
+    meeting = _get_meeting_or_404(db, meeting_id)
+    meeting.deleted_at = utc_now()
+    db.commit()
+    return ActionResponse(ok=True)
+
+
+@router.post("/{meeting_id}/restore", response_model=ActionResponse)
+def restore_meeting(
+    meeting_id: str,
+    db: Session = Depends(get_db),
+) -> ActionResponse:
+    """从回收站恢复会议。"""
+
+    meeting = _get_meeting_or_404(db, meeting_id)
+    meeting.deleted_at = None
+    db.commit()
+    return ActionResponse(ok=True)
+
+
+@router.delete("/{meeting_id}/purge", response_model=ActionResponse)
+def purge_meeting(
+    meeting_id: str,
+    db: Session = Depends(get_db),
+) -> ActionResponse:
+    """永久删除会议记录和本地音频文件。"""
+
+    meeting = _get_meeting_or_404(db, meeting_id)
+    audio_file_path = meeting.audio_file_path
+    db.delete(meeting)
+    db.commit()
+
+    if audio_file_path:
+        Path(audio_file_path).unlink(missing_ok=True)
+
+    return ActionResponse(ok=True)
 
 
 @router.post("/{meeting_id}/chat", response_model=ChatResponse)
@@ -208,6 +301,28 @@ def _extract_task_status(result: dict[str, Any]) -> str:
     return "PROCESSING"
 
 
+def _extract_duration_seconds(result: dict[str, Any], transcript: list[dict[str, Any]]) -> int:
+    """从 ASR 结果或逐字稿中提取会议时长。"""
+
+    raw_duration = result.get("BizDuration") or result.get("Duration") or result.get("duration")
+    if raw_duration:
+        try:
+            duration = int(float(raw_duration))
+            return max(0, duration // 1000 if duration > 24 * 60 * 60 else duration)
+        except (TypeError, ValueError):
+            pass
+
+    max_end_time = 0
+    for item in transcript:
+        end_time = item.get("end_time") or item.get("start_time") or 0
+        try:
+            max_end_time = max(max_end_time, int(end_time))
+        except (TypeError, ValueError):
+            continue
+
+    return max(0, (max_end_time + 999) // 1000)
+
+
 def _generate_summary_safely(transcript: list[dict[str, Any]]) -> str:
     """ASR 完成后立即触发 LLM 总结。"""
 
@@ -220,7 +335,20 @@ def _status_response(meeting: Meeting, error: str | None = None) -> MeetingStatu
         meeting_id=meeting.id,
         status=meeting.asr_status.value,
         title=meeting.title,
+        upload_time=meeting.upload_time,
+        duration_seconds=meeting.duration_seconds or 0,
         transcript=meeting.transcript_json,
         summary_markdown=meeting.summary_markdown,
         error=error,
+    )
+
+
+def _meeting_list_item(meeting: Meeting) -> MeetingListItem:
+    return MeetingListItem(
+        id=meeting.id,
+        title=meeting.title,
+        upload_time=meeting.upload_time,
+        asr_status=meeting.asr_status.value,
+        duration_seconds=meeting.duration_seconds or 0,
+        deleted_at=meeting.deleted_at,
     )

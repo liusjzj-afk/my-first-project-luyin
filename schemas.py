@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -16,9 +17,31 @@ class MeetingStatusResponse(BaseModel):
     meeting_id: str
     status: str
     title: str
+    upload_time: datetime | None = None
+    duration_seconds: int | None = None
     transcript: list[dict[str, Any]] | None = None
     summary_markdown: str | None = None
     error: str | None = None
+
+
+class MeetingListItem(BaseModel):
+    id: str
+    title: str
+    upload_time: datetime
+    asr_status: str
+    duration_seconds: int
+    deleted_at: datetime | None = None
+
+
+class MeetingStatsResponse(BaseModel):
+    used_minutes: int
+    meeting_count: int
+    processing_count: int
+    trash_count: int
+
+
+class ActionResponse(BaseModel):
+    ok: bool
 
 
 class ChatRequest(BaseModel):

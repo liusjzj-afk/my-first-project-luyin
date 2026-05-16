@@ -1,14 +1,25 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import {
+  ArrowLeft,
   Bot,
   Check,
   Clipboard,
+  FileAudio,
+  FileText,
+  Home,
   Loader2,
   Mic2,
+  MoreHorizontal,
+  RotateCcw,
+  Search,
   Send,
-  UploadCloud,
-  UserRound
+  Sparkles,
+  Trash2,
+  Upload,
+  UserRound,
+  UsersRound,
+  X
 } from "lucide-react";
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
@@ -24,9 +35,27 @@ type MeetingStatus = {
   meeting_id: string;
   status: "PENDING" | "PROCESSING" | "COMPLETED" | "FAILED";
   title: string;
+  upload_time?: string;
+  duration_seconds?: number;
   transcript?: TranscriptItem[] | null;
   summary_markdown?: string | null;
   error?: string | null;
+};
+
+type MeetingListItem = {
+  id: string;
+  title: string;
+  upload_time: string;
+  asr_status: "PENDING" | "PROCESSING" | "COMPLETED" | "FAILED";
+  duration_seconds: number;
+  deleted_at?: string | null;
+};
+
+type MeetingStats = {
+  used_minutes: number;
+  meeting_count: number;
+  processing_count: number;
+  trash_count: number;
 };
 
 type ChatMessage = {
@@ -35,23 +64,37 @@ type ChatMessage = {
 };
 
 type UploadState = "idle" | "uploading" | "processing" | "completed" | "failed";
+type ActiveView = "library" | "trash" | "detail";
+type DetailPanel = "summary" | "speakers";
+
+const defaultStats: MeetingStats = {
+  used_minutes: 0,
+  meeting_count: 0,
+  processing_count: 0,
+  trash_count: 0
+};
 
 const speakerColors = [
-  "bg-cyan-500",
-  "bg-emerald-500",
-  "bg-amber-500",
-  "bg-rose-500",
-  "bg-indigo-500",
-  "bg-slate-500"
+  "bg-[#4f7cff]",
+  "bg-[#29c7a6]",
+  "bg-[#39bdf8]",
+  "bg-[#8057f5]",
+  "bg-[#d75bd5]",
+  "bg-[#f4a340]"
 ];
 
 function App() {
+  const [activeView, setActiveView] = useState<ActiveView>("library");
   const [currentMeetingId, setCurrentMeetingId] = useState<string>("");
+  const [meetings, setMeetings] = useState<MeetingListItem[]>([]);
+  const [stats, setStats] = useState<MeetingStats>(defaultStats);
   const [meeting, setMeeting] = useState<MeetingStatus | null>(null);
   const [uploadState, setUploadState] = useState<UploadState>("idle");
   const [statusText, setStatusText] = useState("等待上传会议音频");
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [query, setQuery] = useState("");
   const [isDragging, setIsDragging] = useState(false);
+  const [detailPanel, setDetailPanel] = useState<DetailPanel>("summary");
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [isSending, setIsSending] = useState(false);
@@ -60,6 +103,11 @@ function App() {
 
   const transcript = meeting?.transcript || [];
   const summary = meeting?.summary_markdown || "";
+  const isTrashView = activeView === "trash";
+
+  useEffect(() => {
+    void refreshLibrary(isTrashView);
+  }, [isTrashView]);
 
   useEffect(() => {
     if (!currentMeetingId || uploadState !== "processing") {
@@ -75,11 +123,15 @@ function App() {
           setUploadState("completed");
           setUploadProgress(100);
           setStatusText("需求纪要已生成");
+          void refreshLibrary(false);
         } else if (next.status === "FAILED") {
           setUploadState("failed");
+          setUploadProgress(100);
           setStatusText(next.error || "处理失败，请检查服务配置");
+          void refreshLibrary(false);
         } else {
-          setStatusText(next.transcript?.length ? "提取需求中..." : "识别中...");
+          setUploadProgress((value) => Math.min(value + 8, 88));
+          setStatusText("识别中...");
         }
       } catch (error) {
         setUploadState("failed");
@@ -92,6 +144,12 @@ function App() {
     return () => window.clearInterval(timer);
   }, [currentMeetingId, uploadState]);
 
+  const filteredMeetings = useMemo(() => {
+    const keyword = query.trim().toLowerCase();
+    if (!keyword) return meetings;
+    return meetings.filter((item) => item.title.toLowerCase().includes(keyword));
+  }, [meetings, query]);
+
   const speakerColorMap = useMemo(() => {
     const map = new Map<string, string>();
     transcript.forEach((item) => {
@@ -102,13 +160,53 @@ function App() {
     return map;
   }, [transcript]);
 
+  const speakerStats = useMemo(() => {
+    const counts = new Map<string, number>();
+    transcript.forEach((item) => counts.set(item.speaker, (counts.get(item.speaker) || 0) + 1));
+    return Array.from(counts.entries()).map(([speaker, count]) => ({ speaker, count }));
+  }, [transcript]);
+
+  const refreshLibrary = async (trash = false) => {
+    try {
+      const [nextMeetings, nextStats] = await Promise.all([
+        fetchMeetings(trash),
+        fetchStats()
+      ]);
+      setMeetings(nextMeetings);
+      setStats(nextStats);
+    } catch (error) {
+      setMeetings([]);
+      setStats(defaultStats);
+      console.error(error);
+    }
+  };
+
+  const openMeeting = async (meetingId: string) => {
+    setCurrentMeetingId(meetingId);
+    const next = await fetchMeetingStatus(meetingId);
+    setMeeting(next);
+    setUploadState(next.status === "COMPLETED" ? "completed" : next.status === "FAILED" ? "failed" : "processing");
+    setStatusText(next.error || statusLabel(next.status));
+    setUploadProgress(next.status === "COMPLETED" || next.status === "FAILED" ? 100 : 52);
+    setChatMessages([]);
+    setDetailPanel("summary");
+    setActiveView("detail");
+  };
+
   const handleFileUpload = async (file: File) => {
     if (!file) return;
     setUploadState("uploading");
     setStatusText("正在上传...");
     setUploadProgress(18);
-    setMeeting(null);
+    setMeeting({
+      meeting_id: "",
+      status: "PROCESSING",
+      title: file.name,
+      transcript: null,
+      summary_markdown: null
+    });
     setChatMessages([]);
+    setActiveView("detail");
 
     const formData = new FormData();
     formData.append("file", file);
@@ -128,11 +226,27 @@ function App() {
       setUploadState("processing");
       setUploadProgress(42);
       setStatusText("识别中...");
+      void refreshLibrary(false);
     } catch (error) {
       setUploadState("failed");
       setStatusText(error instanceof Error ? error.message : "上传失败");
-      setUploadProgress(0);
+      setUploadProgress(100);
     }
+  };
+
+  const deleteMeeting = async (meetingId: string) => {
+    await mutateMeeting(`/api/meetings/${meetingId}`, "DELETE");
+    await refreshLibrary(false);
+  };
+
+  const restoreMeeting = async (meetingId: string) => {
+    await mutateMeeting(`/api/meetings/${meetingId}/restore`, "POST");
+    await refreshLibrary(true);
+  };
+
+  const purgeMeeting = async (meetingId: string) => {
+    await mutateMeeting(`/api/meetings/${meetingId}/purge`, "DELETE");
+    await refreshLibrary(true);
   };
 
   const sendMessage = async () => {
@@ -171,159 +285,537 @@ function App() {
     window.setTimeout(() => setCopied(false), 1400);
   };
 
+  if (activeView === "detail") {
+    return (
+      <MeetingDetailView
+        meeting={meeting}
+        transcript={transcript}
+        speakerStats={speakerStats}
+        speakerColorMap={speakerColorMap}
+        detailPanel={detailPanel}
+        uploadState={uploadState}
+        statusText={statusText}
+        uploadProgress={uploadProgress}
+        copied={copied}
+        chatMessages={chatMessages}
+        chatInput={chatInput}
+        isSending={isSending}
+        onBack={() => {
+          setActiveView("library");
+          void refreshLibrary(false);
+        }}
+        onChangePanel={setDetailPanel}
+        onCopySummary={() => void copySummary()}
+        onChangeChatInput={setChatInput}
+        onSendMessage={() => void sendMessage()}
+      />
+    );
+  }
+
   return (
-    <main className="min-h-screen bg-[#f6f8fb] text-slate-950">
-      <div className="mx-auto grid min-h-screen max-w-[1720px] gap-4 p-4 lg:grid-cols-[40%_60%]">
-        <section className="panel flex min-h-[calc(100vh-32px)] flex-col overflow-hidden">
-          <div className="border-b border-slate-200 p-4">
-            <div className="mb-4 flex items-center justify-between gap-3">
-              <div className="flex items-center gap-2">
-                <div className="grid h-9 w-9 place-items-center rounded-md bg-slate-950 text-white">
-                  <Mic2 size={18} />
-                </div>
-                <div>
-                  <h1 className="text-base font-semibold">SystemReq-Copilot</h1>
-                  <p className="text-xs text-slate-500">{meeting?.title || "会议需求智能提取系统"}</p>
-                </div>
-              </div>
-              <StatusPill state={uploadState} />
-            </div>
+    <LibraryView
+      activeView={activeView}
+      meetings={filteredMeetings}
+      stats={stats}
+      query={query}
+      uploadState={uploadState}
+      statusText={statusText}
+      uploadProgress={uploadProgress}
+      isDragging={isDragging}
+      inputRef={inputRef}
+      onSetView={setActiveView}
+      onSetQuery={setQuery}
+      onSetDragging={setIsDragging}
+      onUpload={(file) => void handleFileUpload(file)}
+      onOpen={(meetingId) => void openMeeting(meetingId)}
+      onDelete={(meetingId) => void deleteMeeting(meetingId)}
+      onRestore={(meetingId) => void restoreMeeting(meetingId)}
+      onPurge={(meetingId) => void purgeMeeting(meetingId)}
+    />
+  );
+}
 
-            <div
-              className={`upload-zone ${isDragging ? "border-cyan-500 bg-cyan-50" : ""}`}
-              onClick={() => inputRef.current?.click()}
-              onDragOver={(event) => {
-                event.preventDefault();
-                setIsDragging(true);
-              }}
-              onDragLeave={() => setIsDragging(false)}
-              onDrop={(event) => {
-                event.preventDefault();
-                setIsDragging(false);
-                const file = event.dataTransfer.files[0];
-                if (file) void handleFileUpload(file);
-              }}
-            >
-              <input
-                ref={inputRef}
-                className="hidden"
-                type="file"
-                accept=".mp3,.wav,.m4a,audio/*"
-                onChange={(event) => {
-                  const file = event.target.files?.[0];
-                  if (file) void handleFileUpload(file);
-                }}
+function LibraryView({
+  activeView,
+  meetings,
+  stats,
+  query,
+  uploadState,
+  statusText,
+  uploadProgress,
+  isDragging,
+  inputRef,
+  onSetView,
+  onSetQuery,
+  onSetDragging,
+  onUpload,
+  onOpen,
+  onDelete,
+  onRestore,
+  onPurge
+}: {
+  activeView: ActiveView;
+  meetings: MeetingListItem[];
+  stats: MeetingStats;
+  query: string;
+  uploadState: UploadState;
+  statusText: string;
+  uploadProgress: number;
+  isDragging: boolean;
+  inputRef: React.RefObject<HTMLInputElement>;
+  onSetView: (view: ActiveView) => void;
+  onSetQuery: (value: string) => void;
+  onSetDragging: (value: boolean) => void;
+  onUpload: (file: File) => void;
+  onOpen: (meetingId: string) => void;
+  onDelete: (meetingId: string) => void;
+  onRestore: (meetingId: string) => void;
+  onPurge: (meetingId: string) => void;
+}) {
+  const isTrash = activeView === "trash";
+
+  return (
+    <main className="library-shell">
+      <aside className="library-sidebar">
+        <div className="brand-mark">
+          <div className="brand-symbol">M</div>
+          <span>会议纪要</span>
+        </div>
+
+        <nav className="side-nav" aria-label="主导航">
+          <button className="side-nav-item" onClick={() => onSetView("library")}>
+            <Home size={18} />
+            <span>主页</span>
+          </button>
+          <button
+            className={`side-nav-item ${!isTrash ? "active" : ""}`}
+            onClick={() => onSetView("library")}
+          >
+            <FileText size={18} />
+            <span>我的内容</span>
+          </button>
+          <button
+            className={`side-nav-item ${isTrash ? "active" : ""}`}
+            onClick={() => onSetView("trash")}
+          >
+            <Trash2 size={18} />
+            <span>回收站</span>
+            {stats.trash_count > 0 && <span className="nav-count">{stats.trash_count}</span>}
+          </button>
+        </nav>
+
+        <div className="usage-card">
+          <div className="usage-title">已用分钟</div>
+          <div className="usage-value">{stats.used_minutes} 分钟</div>
+          <div className="usage-row">
+            <span>内容数量</span>
+            <strong>{stats.meeting_count}</strong>
+          </div>
+          <div className="usage-row">
+            <span>处理中</span>
+            <strong>{stats.processing_count}</strong>
+          </div>
+        </div>
+      </aside>
+
+      <section className="library-main">
+        <header className="library-topbar">
+          <label className="search-box">
+            <Search size={18} />
+            <input
+              value={query}
+              onChange={(event) => onSetQuery(event.target.value)}
+              placeholder="搜索妙记"
+            />
+          </label>
+          <div className="topbar-actions">
+            <button className="primary-button" onClick={() => inputRef.current?.click()}>
+              <Mic2 size={17} />
+              <span>录音</span>
+            </button>
+            <button className="secondary-button" onClick={() => inputRef.current?.click()}>
+              <Upload size={17} />
+              <span>上传</span>
+            </button>
+          </div>
+        </header>
+
+        <div
+          className={`library-upload-strip ${isDragging ? "dragging" : ""}`}
+          onClick={() => inputRef.current?.click()}
+          onDragOver={(event) => {
+            event.preventDefault();
+            onSetDragging(true);
+          }}
+          onDragLeave={() => onSetDragging(false)}
+          onDrop={(event) => {
+            event.preventDefault();
+            onSetDragging(false);
+            const file = event.dataTransfer.files[0];
+            if (file) onUpload(file);
+          }}
+        >
+          <input
+            ref={inputRef}
+            className="hidden"
+            type="file"
+            accept=".mp3,.wav,.m4a,audio/*"
+            onChange={(event) => {
+              const file = event.target.files?.[0];
+              if (file) onUpload(file);
+            }}
+          />
+          <FileAudio size={20} />
+          <div>
+            <strong>{statusText}</strong>
+            <span>支持 MP3 / WAV / M4A，最大 100 MB</span>
+          </div>
+          {uploadState !== "idle" && (
+            <div className="mini-progress" aria-label="上传和识别进度">
+              <div style={{ width: `${uploadProgress}%` }} />
+            </div>
+          )}
+        </div>
+
+        <div className="content-header">
+          <h1>{isTrash ? "回收站" : "我的内容"}</h1>
+        </div>
+
+        <div className="meeting-table" role="table" aria-label={isTrash ? "回收站列表" : "我的内容列表"}>
+          <div className="meeting-table-head" role="row">
+            <span>文件</span>
+            <span>创建时间</span>
+            <span>操作</span>
+          </div>
+          {meetings.length ? (
+            meetings.map((item) => (
+              <MeetingRow
+                key={item.id}
+                meeting={item}
+                isTrash={isTrash}
+                onOpen={onOpen}
+                onDelete={onDelete}
+                onRestore={onRestore}
+                onPurge={onPurge}
               />
-              <UploadCloud className="text-slate-600" size={24} />
-              <div className="min-w-0">
-                <p className="truncate text-sm font-medium text-slate-900">拖拽或点击上传音频</p>
-                <p className="text-xs text-slate-500">MP3 / WAV / M4A，最大 100 MB</p>
-              </div>
+            ))
+          ) : (
+            <div className="table-empty">
+              {isTrash ? "暂无删除内容" : "暂无内容，上传会议音频后会显示在这里。"}
             </div>
+          )}
+        </div>
+      </section>
+    </main>
+  );
+}
 
-            <div className="mt-4">
-              <div className="mb-2 flex items-center justify-between text-xs">
-                <span className="text-slate-500">{statusText}</span>
-                <span className="font-medium text-slate-700">{uploadProgress}%</span>
-              </div>
-              <div className="h-2 overflow-hidden rounded-full bg-slate-200">
-                <div
-                  className="h-full rounded-full bg-cyan-500 transition-all duration-500"
-                  style={{ width: `${uploadProgress}%` }}
-                />
-              </div>
-            </div>
+function MeetingRow({
+  meeting,
+  isTrash,
+  onOpen,
+  onDelete,
+  onRestore,
+  onPurge
+}: {
+  meeting: MeetingListItem;
+  isTrash: boolean;
+  onOpen: (meetingId: string) => void;
+  onDelete: (meetingId: string) => void;
+  onRestore: (meetingId: string) => void;
+  onPurge: (meetingId: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div className="meeting-table-row" role="row">
+      <button className="file-cell" onClick={() => !isTrash && onOpen(meeting.id)}>
+        <span className="file-thumb">
+          <Mic2 size={24} />
+        </span>
+        <span className="file-meta">
+          <strong>{meeting.title}</strong>
+          <span>{formatDuration(meeting.duration_seconds)} · {statusLabel(meeting.asr_status)}</span>
+        </span>
+      </button>
+      <time>{formatDateTime(meeting.upload_time)}</time>
+      <div className="row-actions">
+        <button
+          className="icon-action"
+          aria-label="更多操作"
+          onClick={() => setOpen((value) => !value)}
+        >
+          <MoreHorizontal size={18} />
+        </button>
+        {open && (
+          <div className="action-menu">
+            {!isTrash ? (
+              <>
+                <button onClick={() => onOpen(meeting.id)}>
+                  <FileText size={16} />
+                  打开
+                </button>
+                <button className="danger" onClick={() => onDelete(meeting.id)}>
+                  <Trash2 size={16} />
+                  删除
+                </button>
+              </>
+            ) : (
+              <>
+                <button onClick={() => onRestore(meeting.id)}>
+                  <RotateCcw size={16} />
+                  恢复
+                </button>
+                <button className="danger" onClick={() => onPurge(meeting.id)}>
+                  <X size={16} />
+                  永久删除
+                </button>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function MeetingDetailView({
+  meeting,
+  transcript,
+  speakerStats,
+  speakerColorMap,
+  detailPanel,
+  uploadState,
+  statusText,
+  uploadProgress,
+  copied,
+  chatMessages,
+  chatInput,
+  isSending,
+  onBack,
+  onChangePanel,
+  onCopySummary,
+  onChangeChatInput,
+  onSendMessage
+}: {
+  meeting: MeetingStatus | null;
+  transcript: TranscriptItem[];
+  speakerStats: Array<{ speaker: string; count: number }>;
+  speakerColorMap: Map<string, string>;
+  detailPanel: DetailPanel;
+  uploadState: UploadState;
+  statusText: string;
+  uploadProgress: number;
+  copied: boolean;
+  chatMessages: ChatMessage[];
+  chatInput: string;
+  isSending: boolean;
+  onBack: () => void;
+  onChangePanel: (panel: DetailPanel) => void;
+  onCopySummary: () => void;
+  onChangeChatInput: (value: string) => void;
+  onSendMessage: () => void;
+}) {
+  const summary = meeting?.summary_markdown || "";
+  const canChat = meeting?.status === "COMPLETED" && transcript.length > 0;
+
+  return (
+    <main className="detail-shell">
+      <header className="detail-topbar">
+        <button className="back-button" onClick={onBack} aria-label="返回列表">
+          <ArrowLeft size={20} />
+        </button>
+        <div className="detail-title">
+          <h1>{meeting?.title || "会议处理中"}</h1>
+          <p>
+            {meeting?.upload_time ? formatDateTime(meeting.upload_time) : "刚刚上传"} · {formatDuration(meeting?.duration_seconds || 0)}
+          </p>
+        </div>
+        <div className="detail-actions">
+          <StatusPill state={uploadState} />
+          <button className="secondary-button" disabled>
+            分享
+          </button>
+          <button className="icon-action" aria-label="更多操作">
+            <MoreHorizontal size={18} />
+          </button>
+        </div>
+      </header>
+
+      <section className="detail-grid">
+        <aside className="summary-pane">
+          <div className="detail-tabs">
+            <button
+              className={detailPanel === "summary" ? "active" : ""}
+              onClick={() => onChangePanel("summary")}
+            >
+              <Sparkles size={16} />
+              智能纪要
+            </button>
+            <button
+              className={detailPanel === "speakers" ? "active" : ""}
+              onClick={() => onChangePanel("speakers")}
+            >
+              <UsersRound size={16} />
+              发言人
+            </button>
           </div>
 
-          <div className="flex min-h-0 flex-1 flex-col">
-            <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
-              <h2 className="text-sm font-semibold">逐字稿</h2>
-              <span className="text-xs text-slate-500">{transcript.length} 条</span>
-            </div>
-            <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
-              {transcript.length ? (
-                <div className="space-y-3">
-                  {transcript.map((item, index) => (
-                    <TranscriptBubble
-                      key={`${item.speaker}-${item.start_time}-${index}`}
-                      item={item}
-                      color={speakerColorMap.get(item.speaker) || speakerColors[0]}
-                    />
-                  ))}
-                </div>
-              ) : (
-                <EmptyState text="上传会议音频后，逐字稿会显示在这里。" />
-              )}
-            </div>
-          </div>
-        </section>
-
-        <section className="grid min-h-[calc(100vh-32px)] gap-4 lg:grid-rows-[60%_40%]">
-          <article className="panel flex min-h-0 flex-col overflow-hidden">
-            <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
-              <h2 className="text-base font-semibold">系统需求分析纪要</h2>
-              <button
-                className="icon-button"
-                title="复制纪要"
-                disabled={!summary}
-                onClick={() => void copySummary()}
-              >
-                {copied ? <Check size={17} /> : <Clipboard size={17} />}
-              </button>
-            </div>
-            <div className="markdown-body min-h-0 flex-1 overflow-y-auto px-6 py-5">
-              {summary ? <ReactMarkdown>{summary}</ReactMarkdown> : <EmptyState text="ASR 完成后会自动生成 Markdown 纪要。" />}
-            </div>
-          </article>
-
-          <article className="panel flex min-h-0 flex-col overflow-hidden">
-            <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
-              <h2 className="text-base font-semibold">Agent 互动窗口</h2>
-              {isSending ? <Loader2 className="animate-spin text-cyan-600" size={17} /> : <Bot className="text-slate-500" size={17} />}
-            </div>
-
-            <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
-              {chatMessages.length ? (
-                <div className="space-y-3">
-                  {chatMessages.map((message, index) => (
-                    <ChatBubble key={`${message.role}-${index}`} message={message} />
-                  ))}
-                </div>
-              ) : (
-                <EmptyState text="会议完成后，可以追问任意会议细节。" />
-              )}
-            </div>
-
-            <div className="border-t border-slate-200 p-4">
-              <div className="flex items-end gap-2">
-                <textarea
-                  value={chatInput}
-                  rows={2}
-                  disabled={!currentMeetingId || uploadState !== "completed"}
-                  onChange={(event) => setChatInput(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" && !event.shiftKey) {
-                      event.preventDefault();
-                      void sendMessage();
-                    }
-                  }}
-                  className="chat-input"
-                  placeholder="输入关于本次会议的问题"
-                />
+          {detailPanel === "summary" ? (
+            <div className="summary-content">
+              <div className="summary-toolbar">
+                <h2>会议纪要</h2>
                 <button
-                  className="send-button"
-                  title="发送"
-                  disabled={!chatInput.trim() || !currentMeetingId || uploadState !== "completed" || isSending}
-                  onClick={() => void sendMessage()}
+                  className="icon-action"
+                  aria-label="复制纪要"
+                  disabled={!summary}
+                  onClick={onCopySummary}
                 >
-                  <Send size={18} />
+                  {copied ? <Check size={17} /> : <Clipboard size={17} />}
                 </button>
               </div>
+              {summary ? (
+                <div className="markdown-body">
+                  <ReactMarkdown>{summary}</ReactMarkdown>
+                </div>
+              ) : (
+                <EmptyBlock text={meeting?.status === "FAILED" ? statusText : "ASR 完成后会自动生成 Markdown 纪要。"} />
+              )}
             </div>
-          </article>
+          ) : (
+            <div className="speaker-list">
+              {speakerStats.length ? (
+                speakerStats.map((item) => (
+                  <div key={item.speaker} className="speaker-row">
+                    <span className={`speaker-dot ${speakerColorMap.get(item.speaker) || speakerColors[0]}`} />
+                    <strong>{item.speaker}</strong>
+                    <span>{item.count} 段发言</span>
+                  </div>
+                ))
+              ) : (
+                <EmptyBlock text="暂无发言人信息。" />
+              )}
+            </div>
+          )}
+        </aside>
+
+        <section className="transcript-pane">
+          <div className="pane-title">
+            <h2>文字记录</h2>
+            <span>{transcript.length} 条</span>
+          </div>
+          <div className="transcript-scroll">
+            {transcript.length ? (
+              transcript.map((item, index) => (
+                <TranscriptLine
+                  key={`${item.speaker}-${item.start_time}-${index}`}
+                  item={item}
+                  color={speakerColorMap.get(item.speaker) || speakerColors[0]}
+                />
+              ))
+            ) : (
+              <EmptyBlock text={meeting?.status === "FAILED" ? statusText : "识别完成后，逐字稿会显示在这里。"} />
+            )}
+          </div>
+          <div className="audio-bar">
+            <div className="audio-progress">
+              <div style={{ width: `${uploadProgress}%` }} />
+            </div>
+            <div className="audio-controls">
+              <button className="play-button" aria-label="播放占位" disabled>
+                <span />
+              </button>
+              <strong>{formatDuration(0)} / {formatDuration(meeting?.duration_seconds || 0)}</strong>
+              <span>1x</span>
+              <MoreHorizontal size={18} />
+            </div>
+          </div>
         </section>
-      </div>
+
+        <aside className="agent-pane">
+          <div className="agent-header">
+            <Bot size={18} />
+            <strong>大模型提问</strong>
+          </div>
+          <div className="agent-body">
+            {chatMessages.length ? (
+              chatMessages.map((message, index) => (
+                <ChatBubble key={`${message.role}-${index}`} message={message} />
+              ))
+            ) : (
+              <div className="agent-empty">
+                <Bot size={30} />
+                <h2>Hi，问点什么</h2>
+                <p>知识范围：当前会议逐字稿与智能纪要</p>
+                <QuestionHint text="不同发言人分别表达了什么观点？" />
+                <QuestionHint text="这场会议有哪些待办事项？" />
+                <QuestionHint text="有哪些未确认的问题？" />
+              </div>
+            )}
+          </div>
+          <div className="agent-input-wrap">
+            {!canChat && <p className="input-hint">{meeting?.status === "FAILED" ? statusText : "会议完成后可提问"}</p>}
+            <div className="agent-input">
+              <textarea
+                value={chatInput}
+                rows={2}
+                disabled={!canChat}
+                onChange={(event) => onChangeChatInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    onSendMessage();
+                  }
+                }}
+                placeholder="问个问题，或用妙记写点内容"
+              />
+              <button
+                className="send-button"
+                aria-label="发送"
+                disabled={!chatInput.trim() || !canChat || isSending}
+                onClick={onSendMessage}
+              >
+                {isSending ? <Loader2 className="animate-spin" size={18} /> : <Send size={18} />}
+              </button>
+            </div>
+          </div>
+        </aside>
+      </section>
     </main>
+  );
+}
+
+function TranscriptLine({ item, color }: { item: TranscriptItem; color: string }) {
+  return (
+    <article className="transcript-line">
+      <div className={`speaker-avatar ${color}`}>{item.speaker.replace("spk_", "")}</div>
+      <div>
+        <div className="transcript-meta">
+          <strong>{item.speaker}</strong>
+          <time>{formatTime(item.start_time)}</time>
+        </div>
+        <p>{item.text}</p>
+      </div>
+    </article>
+  );
+}
+
+function ChatBubble({ message }: { message: ChatMessage }) {
+  const isUser = message.role === "user";
+  return (
+    <div className={`chat-bubble-row ${isUser ? "user" : "assistant"}`}>
+      <div className="chat-avatar">{isUser ? <UserRound size={15} /> : <Bot size={15} />}</div>
+      <div className="chat-bubble">{message.content}</div>
+    </div>
+  );
+}
+
+function QuestionHint({ text }: { text: string }) {
+  return (
+    <button className="question-hint" disabled>
+      <Sparkles size={16} />
+      <span>{text}</span>
+    </button>
   );
 }
 
@@ -335,68 +827,34 @@ function StatusPill({ state }: { state: UploadState }) {
     completed: "已完成",
     failed: "失败"
   };
-  const colorMap: Record<UploadState, string> = {
-    idle: "bg-slate-100 text-slate-600",
-    uploading: "bg-amber-100 text-amber-700",
-    processing: "bg-cyan-100 text-cyan-700",
-    completed: "bg-emerald-100 text-emerald-700",
-    failed: "bg-rose-100 text-rose-700"
-  };
-
-  return <span className={`rounded-md px-2.5 py-1 text-xs font-medium ${colorMap[state]}`}>{labelMap[state]}</span>;
+  return <span className={`status-pill ${state}`}>{labelMap[state]}</span>;
 }
 
-function TranscriptBubble({ item, color }: { item: TranscriptItem; color: string }) {
-  return (
-    <div className="rounded-md border border-slate-200 bg-white p-3">
-      <div className="mb-2 flex items-center justify-between gap-2 text-xs">
-        <span className="flex items-center gap-2 font-medium text-slate-700">
-          <span className={`h-2.5 w-2.5 rounded-full ${color}`} />
-          {item.speaker}
-        </span>
-        <time className="tabular-nums text-slate-500">{formatTime(item.start_time)}</time>
-      </div>
-      <p className="text-sm leading-6 text-slate-800">{item.text}</p>
-    </div>
-  );
+function EmptyBlock({ text }: { text: string }) {
+  return <div className="empty-block">{text}</div>;
 }
 
-function ChatBubble({ message }: { message: ChatMessage }) {
-  const isUser = message.role === "user";
-  return (
-    <div className={`flex gap-2 ${isUser ? "justify-end" : "justify-start"}`}>
-      {!isUser && (
-        <div className="mt-1 grid h-7 w-7 shrink-0 place-items-center rounded-md bg-slate-900 text-white">
-          <Bot size={15} />
-        </div>
-      )}
-      <div className={`max-w-[78%] rounded-md px-3 py-2 text-sm leading-6 ${isUser ? "bg-cyan-600 text-white" : "bg-slate-100 text-slate-800"}`}>
-        {message.content}
-      </div>
-      {isUser && (
-        <div className="mt-1 grid h-7 w-7 shrink-0 place-items-center rounded-md bg-cyan-600 text-white">
-          <UserRound size={15} />
-        </div>
-      )}
-    </div>
-  );
+async function fetchMeetings(trash = false): Promise<MeetingListItem[]> {
+  const response = await fetch(`${API_BASE_URL}/api/meetings?trash=${trash}`);
+  if (!response.ok) throw new Error(await readError(response));
+  return response.json();
 }
 
-function EmptyState({ text }: { text: string }) {
-  return (
-    <div className="grid h-full min-h-40 place-items-center rounded-md border border-dashed border-slate-300 bg-slate-50 px-4 text-center text-sm text-slate-500">
-      {text}
-    </div>
-  );
+async function fetchStats(): Promise<MeetingStats> {
+  const response = await fetch(`${API_BASE_URL}/api/meetings/stats`);
+  if (!response.ok) throw new Error(await readError(response));
+  return response.json();
 }
 
 async function fetchMeetingStatus(meetingId: string): Promise<MeetingStatus> {
   const response = await fetch(`${API_BASE_URL}/api/meetings/${meetingId}/status`);
-  if (!response.ok) {
-    const detail = await readError(response);
-    throw new Error(detail);
-  }
+  if (!response.ok) throw new Error(await readError(response));
   return response.json();
+}
+
+async function mutateMeeting(path: string, method: "DELETE" | "POST") {
+  const response = await fetch(`${API_BASE_URL}${path}`, { method });
+  if (!response.ok) throw new Error(await readError(response));
 }
 
 async function readError(response: Response) {
@@ -415,6 +873,40 @@ function formatTime(milliseconds: number) {
     .padStart(2, "0");
   const seconds = (totalSeconds % 60).toString().padStart(2, "0");
   return `${minutes}:${seconds}`;
+}
+
+function formatDuration(seconds: number) {
+  const safeSeconds = Math.max(0, Math.floor(seconds));
+  const hours = Math.floor(safeSeconds / 3600);
+  const minutes = Math.floor((safeSeconds % 3600) / 60);
+  const rest = safeSeconds % 60;
+  if (hours) {
+    return `${hours} 小时 ${minutes} 分 ${rest} 秒`;
+  }
+  if (minutes) {
+    return `${minutes} 分 ${rest} 秒`;
+  }
+  return `${rest} 秒`;
+}
+
+function formatDateTime(value: string) {
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit"
+  }).format(new Date(value));
+}
+
+function statusLabel(status: MeetingStatus["status"] | MeetingListItem["asr_status"]) {
+  const labels = {
+    PENDING: "待处理",
+    PROCESSING: "识别中",
+    COMPLETED: "已完成",
+    FAILED: "失败"
+  };
+  return labels[status];
 }
 
 export default App;

@@ -7,7 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from api.meetings import router as meetings_router
 from config import get_settings
-from models import Base, engine
+from models import ensure_schema
 
 
 app = FastAPI(
@@ -33,7 +33,7 @@ def on_startup() -> None:
 
     settings = get_settings()
     settings.upload_dir.mkdir(parents=True, exist_ok=True)
-    Base.metadata.create_all(bind=engine)
+    ensure_schema()
 
 
 @app.get("/api/health")
