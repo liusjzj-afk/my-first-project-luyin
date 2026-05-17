@@ -16,6 +16,8 @@ class UploadMeetingResponse(BaseModel):
 class MeetingStatusResponse(BaseModel):
     meeting_id: str
     status: str
+    asr_status: str | None = None
+    llm_status: str | None = None
     title: str
     upload_time: datetime | None = None
     duration_seconds: int | None = None
@@ -35,6 +37,7 @@ class MeetingListItem(BaseModel):
     title: str
     upload_time: datetime
     asr_status: str
+    llm_status: str | None = None
     duration_seconds: int
     audio_duration: int
     eta_seconds: int | None = None
@@ -59,3 +62,32 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     reply: str
+
+
+class RetrySummaryResponse(BaseModel):
+    ok: bool
+    llm_status: str
+
+
+class PresignedUploadResponse(BaseModel):
+    meeting_id: str
+    object_key: str
+    upload_url: str
+    method: str = "PUT"
+    expires_in: int
+    headers: dict[str, str] = {}
+
+
+class PresignedUploadCompleteRequest(BaseModel):
+    object_key: str
+    title: str
+    meeting_type: str = Field(default="default", max_length=64)
+    size_bytes: int = Field(default=0, ge=0)
+    content_type: str | None = None
+    audio_duration: int | None = Field(default=0, ge=0)
+
+
+class PresignedUploadCompleteResponse(BaseModel):
+    meeting_id: str
+    status: str
+    object_key: str

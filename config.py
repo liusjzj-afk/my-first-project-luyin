@@ -33,6 +33,16 @@ class Settings(BaseSettings):
     llm_base_url: str | None = None
     llm_model: str = "gpt-4o-mini"
     meeting_agent_prompt_path: Path = Path("./meeting_agent_prompt.md")
+    summary_prompt_dir: Path = Path("./prompts")
+
+    # 商业化任务队列：默认本地线程兼容 MVP；生产建议 ENABLE_CELERY=true。
+    enable_celery: bool = False
+    celery_broker_url: str = "redis://localhost:6379/0"
+    celery_result_backend: str = "redis://localhost:6379/1"
+
+    # 多租户占位：未接入鉴权前使用默认租户，后续由认证中间件注入。
+    default_tenant_id: str = "public"
+    default_user_id: str = "local-user"
 
     # 阿里云 ASR/OSS 环境变量在 services/asr_service.py 中读取：
     # ALIYUN_AK, ALIYUN_SK, ALIYUN_APPKEY, ALIYUN_REGION_ID,

@@ -42,11 +42,27 @@ class ASRStatus(str, enum.Enum):
     FAILED = "FAILED"
 
 
+class LLMStatus(str, enum.Enum):
+    """会议 LLM 总结状态。"""
+
+    PENDING = "PENDING"
+    PROCESSING = "PROCESSING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
 class ChatRole(str, enum.Enum):
     """Agent 对话角色。"""
 
     USER = "user"
     ASSISTANT = "assistant"
+
+
+class UsageService(str, enum.Enum):
+    """第三方服务用量类型。"""
+
+    ASR = "ASR"
+    LLM = "LLM"
 
 
 class Meeting(Base):
@@ -65,10 +81,54 @@ class Meeting(Base):
         nullable=False,
         comment="会议标题，默认使用上传文件名",
     )
+    meeting_type: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="default",
+        index=True,
+        comment="会议类型，用于选择总结 Prompt",
+    )
+    tenant_id: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="public",
+        index=True,
+        comment="租户 ID",
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="local-user",
+        index=True,
+        comment="用户 ID",
+    )
     audio_file_path: Mapped[str] = mapped_column(
         String(1024),
         nullable=False,
+        default="",
         comment="本地音频文件绝对路径",
+    )
+    media_object_key: Mapped[str | None] = mapped_column(
+        String(1024),
+        nullable=True,
+        index=True,
+        comment="云存储对象 Key",
+    )
+    media_bucket: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+        comment="云存储 Bucket",
+    )
+    media_size_bytes: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+        default=0,
+        comment="媒体文件大小，单位字节",
+    )
+    media_content_type: Mapped[str | None] = mapped_column(
+        String(128),
+        nullable=True,
+        comment="媒体文件 MIME 类型",
     )
     upload_time: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -86,6 +146,17 @@ class Meeting(Base):
         nullable=False,
         default=ASRStatus.PENDING,
         comment="ASR 任务状态",
+    )
+    llm_status: Mapped[LLMStatus] = mapped_column(
+        Enum(LLMStatus, native_enum=False, length=32),
+        nullable=False,
+        default=LLMStatus.PENDING,
+        comment="LLM 总结状态",
+    )
+    llm_error: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="LLM 总结失败原因",
     )
     duration_seconds: Mapped[int | None] = mapped_column(
         Integer,
@@ -130,6 +201,70 @@ class Meeting(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+    transcripts: Mapped[list["Transcript"]] = relationship(
+        back_populates="meeting",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    summaries: Mapped[list["Summary"]] = relationship(
+        back_populates="meeting",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    usage_logs: Mapped[list["UsageLog"]] = relationship(
+        back_populates="meeting",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class Transcript(Base):
+    """会议逐字稿快照。"""
+
+    __tablename__ = "transcripts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True, default="public")
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True, default="local-user")
+    meeting_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("meetings.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    content_json: Mapped[list[dict]] = mapped_column(JSON, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, index=True)
+
+    meeting: Mapped[Meeting] = relationship(back_populates="transcripts")
+
+
+class Summary(Base):
+    """会议需求总结快照。"""
+
+    __tablename__ = "summaries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True, default="public")
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True, default="local-user")
+    meeting_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("meetings.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    status: Mapped[LLMStatus] = mapped_column(
+        Enum(LLMStatus, native_enum=False, length=32),
+        nullable=False,
+        default=LLMStatus.PENDING,
+    )
+    summary_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ia_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    raw_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+
+    meeting: Mapped[Meeting] = relationship(back_populates="summaries")
 
 
 class ChatHistory(Base):
@@ -150,6 +285,20 @@ class ChatHistory(Base):
         index=True,
         comment="关联会议 ID",
     )
+    tenant_id: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="public",
+        index=True,
+        comment="租户 ID",
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="local-user",
+        index=True,
+        comment="用户 ID",
+    )
     role: Mapped[ChatRole] = mapped_column(
         Enum(ChatRole, native_enum=False, length=32),
         nullable=False,
@@ -169,6 +318,37 @@ class ChatHistory(Base):
     )
 
     meeting: Mapped[Meeting] = relationship(back_populates="chat_histories")
+
+
+class UsageLog(Base):
+    """第三方 ASR/LLM 用量记录，为后续计费提供底座。"""
+
+    __tablename__ = "usage_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True, default="public")
+    user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True, default="local-user")
+    meeting_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("meetings.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    service: Mapped[UsageService] = mapped_column(
+        Enum(UsageService, native_enum=False, length=32),
+        nullable=False,
+        index=True,
+    )
+    provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    quantity_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, index=True)
+
+    meeting: Mapped[Meeting | None] = relationship(back_populates="usage_logs")
 
 
 engine = create_engine(
@@ -212,3 +392,30 @@ def ensure_schema() -> None:
             connection.execute(text("ALTER TABLE meetings ADD COLUMN summary_content TEXT"))
         if "ia_content" not in columns:
             connection.execute(text("ALTER TABLE meetings ADD COLUMN ia_content TEXT"))
+        if "tenant_id" not in columns:
+            connection.execute(text("ALTER TABLE meetings ADD COLUMN tenant_id VARCHAR(64) DEFAULT 'public' NOT NULL"))
+        if "user_id" not in columns:
+            connection.execute(text("ALTER TABLE meetings ADD COLUMN user_id VARCHAR(64) DEFAULT 'local-user' NOT NULL"))
+        if "meeting_type" not in columns:
+            connection.execute(text("ALTER TABLE meetings ADD COLUMN meeting_type VARCHAR(64) DEFAULT 'default' NOT NULL"))
+        if "llm_status" not in columns:
+            connection.execute(text("ALTER TABLE meetings ADD COLUMN llm_status VARCHAR(32) DEFAULT 'PENDING' NOT NULL"))
+        if "llm_error" not in columns:
+            connection.execute(text("ALTER TABLE meetings ADD COLUMN llm_error TEXT"))
+        if "media_object_key" not in columns:
+            connection.execute(text("ALTER TABLE meetings ADD COLUMN media_object_key VARCHAR(1024)"))
+        if "media_bucket" not in columns:
+            connection.execute(text("ALTER TABLE meetings ADD COLUMN media_bucket VARCHAR(255)"))
+        if "media_size_bytes" not in columns:
+            connection.execute(text("ALTER TABLE meetings ADD COLUMN media_size_bytes INTEGER DEFAULT 0"))
+        if "media_content_type" not in columns:
+            connection.execute(text("ALTER TABLE meetings ADD COLUMN media_content_type VARCHAR(128)"))
+
+        chat_columns = {
+            row[1]
+            for row in connection.execute(text("PRAGMA table_info(chat_histories)")).fetchall()
+        }
+        if "tenant_id" not in chat_columns:
+            connection.execute(text("ALTER TABLE chat_histories ADD COLUMN tenant_id VARCHAR(64) DEFAULT 'public' NOT NULL"))
+        if "user_id" not in chat_columns:
+            connection.execute(text("ALTER TABLE chat_histories ADD COLUMN user_id VARCHAR(64) DEFAULT 'local-user' NOT NULL"))

@@ -108,20 +108,25 @@ class LLMService:
         client_kwargs["http_client"] = httpx.Client()
         self.client = OpenAI(**client_kwargs)
 
-    def summarize_requirements(self, transcript: list[dict[str, Any]]) -> dict[str, str]:
+    def summarize_requirements(self, transcript: list[dict[str, Any]], *, meeting_type: str = "default") -> dict[str, str]:
         """根据逐字稿提取需求分析和信息架构 Markdown。"""
 
         transcript_text = format_transcript_for_llm(transcript)
         response = self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+                {"role": "system", "content": load_summary_prompt(meeting_type)},
                 {"role": "user", "content": transcript_text},
             ],
             temperature=0.2,
         )
         content = strip_model_thinking(response.choices[0].message.content or "")
-        return split_summary_sections(content)
+        sections = split_summary_sections(content)
+        if response.usage:
+            sections["input_tokens"] = str(response.usage.prompt_tokens or 0)
+            sections["output_tokens"] = str(response.usage.completion_tokens or 0)
+            sections["total_tokens"] = str(response.usage.total_tokens or 0)
+        return sections
 
     def answer_meeting_question(
         self,
@@ -161,6 +166,22 @@ def load_meeting_agent_prompt() -> str:
     except OSError:
         return DEFAULT_MEETING_AGENT_PROMPT
     return content or DEFAULT_MEETING_AGENT_PROMPT
+
+
+def load_summary_prompt(meeting_type: str = "default") -> str:
+    """Load a meeting-type-specific summary prompt, falling back to default."""
+
+    settings = get_settings()
+    safe_meeting_type = re.sub(r"[^a-zA-Z0-9_-]", "", meeting_type or "default") or "default"
+    prompt_path = settings.summary_prompt_dir / f"{safe_meeting_type}.md"
+    if not prompt_path.is_absolute():
+        prompt_path = Path.cwd() / prompt_path
+
+    try:
+        content = prompt_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return SUMMARY_SYSTEM_PROMPT
+    return content or SUMMARY_SYSTEM_PROMPT
 
 
 def build_meeting_agent_messages(

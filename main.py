@@ -6,8 +6,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.meetings import router as meetings_router
+from api.uploads import router as uploads_router
 from config import get_settings
 from models import ensure_schema
+from services.meeting_processing import resume_incomplete_meetings
 
 
 app = FastAPI(
@@ -25,6 +27,7 @@ app.add_middleware(
 )
 
 app.include_router(meetings_router)
+app.include_router(uploads_router)
 
 
 @app.on_event("startup")
@@ -34,6 +37,7 @@ def on_startup() -> None:
     settings = get_settings()
     settings.upload_dir.mkdir(parents=True, exist_ok=True)
     ensure_schema()
+    resume_incomplete_meetings()
 
 
 @app.get("/api/health")
