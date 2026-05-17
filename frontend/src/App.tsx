@@ -1,4 +1,4 @@
-import { isValidElement, type RefObject, useEffect, useId, useMemo, useRef, useState } from "react";
+import { isValidElement, type RefObject, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { BrowserRouter, Navigate, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -632,7 +632,6 @@ function TranscriptPlayerDocument({
   durationSeconds: number;
 }) {
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const segmentRefs = useRef<Array<HTMLElement | null>>([]);
   const [currentTimeMs, setCurrentTimeMs] = useState(0);
   const segments = useMemo(() => normalizeTranscriptSegments(transcript, durationSeconds), [durationSeconds, transcript]);
   const activeIndex = useMemo(
@@ -641,17 +640,41 @@ function TranscriptPlayerDocument({
   );
 
   useEffect(() => {
-    const activeElement = activeIndex >= 0 ? segmentRefs.current[activeIndex] : null;
-    activeElement?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [activeIndex]);
-
-  const handleTextClick = (startTime: number) => {
     const player = audioRef.current;
-    if (!player) return;
-    player.currentTime = startTime;
+    if (!player || !audioUrl) return;
+    setCurrentTimeMs(0);
+    player.load();
+  }, [audioUrl]);
+
+  const updateCurrentTime = useCallback((player: HTMLAudioElement) => {
     setCurrentTimeMs(player.currentTime * 1000);
-    void player.play().catch(() => undefined);
-  };
+  }, []);
+
+  const playSegment = useCallback((segment: TranscriptSegment) => {
+    const player = audioRef.current;
+    const targetTime = Math.max(0, segment.startTime);
+    if (!player || !audioUrl || !Number.isFinite(targetTime)) return;
+
+    setCurrentTimeMs(targetTime * 1000);
+
+    const seekAndPlay = () => {
+      const hasDuration = Number.isFinite(player.duration) && player.duration > 0;
+      const maxSeekTime = hasDuration ? Math.max(0, player.duration - 0.05) : targetTime;
+      const nextTime = Math.min(targetTime, maxSeekTime);
+
+      player.currentTime = nextTime;
+      updateCurrentTime(player);
+      void player.play().catch(() => undefined);
+    };
+
+    if (player.readyState >= HTMLMediaElement.HAVE_METADATA) {
+      seekAndPlay();
+      return;
+    }
+
+    player.addEventListener("loadedmetadata", seekAndPlay, { once: true });
+    player.load();
+  }, [audioUrl, updateCurrentTime]);
 
   if (!segments.length) {
     return <div className="empty-panel">{status === "FAILED" ? "识别失败，暂无逐字稿。" : "识别完成后，逐字稿会显示在这里。"}</div>;
@@ -669,18 +692,16 @@ function TranscriptPlayerDocument({
           controls
           preload="metadata"
           src={audioUrl}
-          onTimeUpdate={(event) => setCurrentTimeMs(event.currentTarget.currentTime * 1000)}
-          onSeeked={(event) => setCurrentTimeMs(event.currentTarget.currentTime * 1000)}
+          onLoadedMetadata={(event) => updateCurrentTime(event.currentTarget)}
+          onTimeUpdate={(event) => updateCurrentTime(event.currentTarget)}
+          onSeeked={(event) => updateCurrentTime(event.currentTarget)}
         />
       </div>
 
       <TranscriptDocument
         transcript={segments}
         activeIndex={activeIndex}
-        onJumpToTime={handleTextClick}
-        registerSegment={(index, element) => {
-          segmentRefs.current[index] = element;
-        }}
+        onSelectSegment={playSegment}
       />
     </div>
   );
@@ -689,27 +710,15 @@ function TranscriptPlayerDocument({
 function TranscriptDocument({
   transcript,
   activeIndex,
-  onJumpToTime,
-  registerSegment
+  onSelectSegment
 }: {
   transcript: TranscriptSegment[];
   activeIndex: number;
-  onJumpToTime: (startTime: number) => void;
-  registerSegment: (index: number, element: HTMLElement | null) => void;
+  onSelectSegment: (segment: TranscriptSegment) => void;
 }) {
   if (!transcript.length) {
     return null;
   }
-  const handleSegmentJump = (event: React.SyntheticEvent<HTMLButtonElement>) => {
-    const startLabel = event.currentTarget.dataset.startLabel || "";
-    const targetSeconds = parseTimeToSeconds(startLabel);
-    if (Number.isFinite(targetSeconds)) onJumpToTime(targetSeconds);
-  };
-  const handleSegmentKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
-    if (event.key !== "Enter" && event.key !== " ") return;
-    event.preventDefault();
-    handleSegmentJump(event);
-  };
 
   return (
     <div className="transcript-document">
@@ -717,14 +726,11 @@ function TranscriptDocument({
         <button
           type="button"
           key={`${item.speaker}-${item.startTime}-${index}`}
-          ref={(element) => registerSegment(index, element)}
           className={`transcript-entry ${activeIndex === index ? "active" : ""}`}
           data-start-time={item.startTime}
-          data-start-label={formatSeconds(item.startTime)}
+          aria-current={activeIndex === index ? "true" : undefined}
           aria-label={`跳转到 ${formatSeconds(item.startTime)} 的文字记录`}
-          onClick={handleSegmentJump}
-          onMouseUp={handleSegmentJump}
-          onKeyDown={handleSegmentKeyDown}
+          onClick={() => onSelectSegment(item)}
         >
           <div className="speaker-token">{item.speaker.replace("spk_", "")}</div>
           <div>
@@ -914,13 +920,15 @@ function stripSectionMarkers(content: string) {
 }
 
 function normalizeTranscriptSegments(transcript: TranscriptItem[], durationSeconds: number): TranscriptSegment[] {
-  const timeUnit = inferTranscriptTimeUnit(transcript, durationSeconds);
   return transcript.map((item, index) => {
-    const startTime = toSeconds(item.startTime ?? item.start_time, timeUnit);
-    const fallbackEnd = transcript[index + 1] ? toSeconds(transcript[index + 1].startTime ?? transcript[index + 1].start_time, timeUnit) : startTime;
-    const endTime = Math.max(startTime, toSeconds(item.endTime ?? item.end_time, timeUnit) || fallbackEnd || startTime);
+    const startTime = readTranscriptTimeSeconds(item, "start", durationSeconds);
+    const explicitEndTime = readTranscriptTimeSeconds(item, "end", durationSeconds);
+    const nextStartTime = transcript[index + 1] ? readTranscriptTimeSeconds(transcript[index + 1], "start", durationSeconds) : 0;
+    const fallbackEndTime = nextStartTime > startTime ? nextStartTime : durationSeconds > startTime ? durationSeconds : startTime;
+    const endTime = explicitEndTime > startTime ? explicitEndTime : fallbackEndTime;
+
     return {
-      speaker: item.speaker,
+      speaker: item.speaker || "未知说话人",
       startTime,
       endTime,
       text: item.text
@@ -928,19 +936,27 @@ function normalizeTranscriptSegments(transcript: TranscriptItem[], durationSecon
   });
 }
 
-function inferTranscriptTimeUnit(transcript: TranscriptItem[], durationSeconds: number): "seconds" | "milliseconds" {
-  const maxTime = transcript.reduce(
-    (maxValue, item) => Math.max(maxValue, item.startTime || item.start_time || 0, item.endTime || item.end_time || 0),
-    0
-  );
-  if (!maxTime) return "milliseconds";
-  if (durationSeconds > 0 && maxTime <= (durationSeconds + 5)) return "seconds";
-  return maxTime <= 24 * 60 * 60 ? "seconds" : "milliseconds";
+function readTranscriptTimeSeconds(item: TranscriptItem, boundary: "start" | "end", durationSeconds: number) {
+  const snakeValue = boundary === "start" ? item.start_time : item.end_time;
+  if (typeof snakeValue === "number") {
+    return Math.max(0, snakeValue / 1000);
+  }
+
+  const camelValue = boundary === "start" ? item.startTime : item.endTime;
+  return normalizeFlexibleTimeValue(camelValue, durationSeconds);
 }
 
-function toSeconds(value: number | undefined, unit: "seconds" | "milliseconds") {
+function normalizeFlexibleTimeValue(value: number | undefined, durationSeconds: number) {
   const safeValue = Math.max(0, Number(value || 0));
-  return unit === "seconds" ? safeValue : safeValue / 1000;
+  if (!Number.isFinite(safeValue) || safeValue <= 0) return 0;
+
+  const durationWithTolerance = Math.max(0, durationSeconds) + 5;
+  if (durationSeconds > 0) {
+    if (safeValue <= durationWithTolerance) return safeValue;
+    if (safeValue / 1000 <= durationWithTolerance) return safeValue / 1000;
+  }
+
+  return safeValue > 24 * 60 * 60 ? safeValue / 1000 : safeValue;
 }
 
 function findActiveTranscriptIndex(
@@ -957,14 +973,6 @@ function findActiveTranscriptIndex(
 
 function formatSeconds(value: number) {
   return formatTime(value * 1000);
-}
-
-function parseTimeToSeconds(value: string) {
-  const parts = value.split(":").map((part) => Number(part));
-  if (!parts.length || parts.length > 3 || parts.some((part) => !Number.isFinite(part) || part < 0)) {
-    return Number.NaN;
-  }
-  return parts.reduce((total, part) => total * 60 + part, 0);
 }
 
 async function fetchMeetings(trash = false): Promise<MeetingListItem[]> {
