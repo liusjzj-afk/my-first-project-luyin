@@ -159,50 +159,55 @@ def get_meeting_status(
         try:
             asr_service = AliyunASRService()
             result = asr_service.get_task_result(meeting.asr_task_id)
-            task_status = _extract_task_status(result)
+        except ASRServiceError as exc:
+            return _status_response(meeting, error=str(exc))
 
-            if task_status == "COMPLETED":
+        task_status = _extract_task_status(result)
+
+        if task_status == "COMPLETED":
+            try:
                 transcript = asr_service.normalize_transcript(result)
-                meeting.transcript_json = transcript
-                detected_duration = _extract_duration_seconds(result, transcript)
-                meeting.duration_seconds = detected_duration or meeting.audio_duration or 0
-                meeting.audio_duration = meeting.audio_duration or detected_duration
-                meeting.asr_status = ASRStatus.SUMMARIZING
-                db.commit()
-                db.refresh(meeting)
-                try:
-                    summary_sections = _generate_summary_safely(transcript)
-                    meeting.summary_content = summary_sections["summary_content"]
-                    meeting.ia_content = summary_sections["ia_content"]
-                    meeting.summary_markdown = summary_sections["raw_content"]
-                    meeting.asr_status = ASRStatus.COMPLETED
-                except Exception as exc:  # LLM 失败不应阻断逐字稿展示。
-                    failure_summary = (
-                        "## 需求纪要生成失败\n\n"
-                        f"{str(exc)}\n\n"
-                        "逐字稿已保存，可在修复 LLM 配置或额度后重新生成。"
-                    )
-                    meeting.summary_content = failure_summary
-                    meeting.ia_content = ""
-                    meeting.summary_markdown = failure_summary
-                    meeting.asr_status = ASRStatus.COMPLETED
-                db.commit()
-                db.refresh(meeting)
-            elif task_status == "FAILED":
+            except ASRServiceError as exc:
                 meeting.asr_status = ASRStatus.FAILED
-                detected_duration = _extract_duration_seconds(result, meeting.transcript_json or [])
-                meeting.duration_seconds = detected_duration or meeting.audio_duration or 0
                 db.commit()
                 db.refresh(meeting)
-                return _status_response(
-                    meeting,
-                    error=str(result.get("StatusText") or result.get("StatusCode") or "ASR 任务失败"),
-                )
-        except (ASRServiceError, LLMServiceError) as exc:
-            meeting.asr_status = ASRStatus.FAILED
+                return _status_response(meeting, error=str(exc))
+
+            meeting.transcript_json = transcript
+            detected_duration = _extract_duration_seconds(result, transcript)
+            meeting.duration_seconds = detected_duration or meeting.audio_duration or 0
+            meeting.audio_duration = meeting.audio_duration or detected_duration
+            meeting.asr_status = ASRStatus.SUMMARIZING
             db.commit()
             db.refresh(meeting)
-            return _status_response(meeting, error=str(exc))
+            try:
+                summary_sections = _generate_summary_safely(transcript)
+                meeting.summary_content = summary_sections["summary_content"]
+                meeting.ia_content = summary_sections["ia_content"]
+                meeting.summary_markdown = summary_sections["raw_content"]
+                meeting.asr_status = ASRStatus.COMPLETED
+            except Exception as exc:  # LLM 失败不应阻断逐字稿展示。
+                failure_summary = (
+                    "## 需求纪要生成失败\n\n"
+                    f"{str(exc)}\n\n"
+                    "逐字稿已保存，可在修复 LLM 配置或额度后重新生成。"
+                )
+                meeting.summary_content = failure_summary
+                meeting.ia_content = ""
+                meeting.summary_markdown = failure_summary
+                meeting.asr_status = ASRStatus.COMPLETED
+            db.commit()
+            db.refresh(meeting)
+        elif task_status == "FAILED":
+            meeting.asr_status = ASRStatus.FAILED
+            detected_duration = _extract_duration_seconds(result, meeting.transcript_json or [])
+            meeting.duration_seconds = detected_duration or meeting.audio_duration or 0
+            db.commit()
+            db.refresh(meeting)
+            return _status_response(
+                meeting,
+                error=str(result.get("StatusText") or result.get("StatusCode") or "ASR 任务失败"),
+            )
 
     if meeting.asr_status == ASRStatus.SUMMARIZING and meeting.transcript_json and not meeting.summary_content:
         try:

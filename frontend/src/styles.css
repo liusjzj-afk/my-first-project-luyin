@@ -316,6 +316,14 @@ textarea:disabled {
   transform: translateY(-1px);
 }
 
+.premium-upload.failed {
+  border-color: rgba(255, 59, 48, 0.3);
+}
+
+.premium-upload.failed strong {
+  color: var(--danger);
+}
+
 .upload-icon,
 .file-glyph,
 .agent-pulse {

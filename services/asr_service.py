@@ -22,11 +22,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 import oss2
+from aliyunsdkcore.acs_exception.exceptions import ClientException, ServerException
 from aliyunsdkcore.client import AcsClient
 from aliyunsdkcore.request import CommonRequest
 from dotenv import load_dotenv
@@ -36,6 +40,10 @@ class ASRServiceError(RuntimeError):
     """ASR 服务调用失败时抛出的业务异常。"""
 
 
+RETRY_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = (1.0, 2.0)
+
+
 def _env_value(name: str, default: str = "") -> str:
     """读取环境变量，并把示例占位文案视为未配置。"""
 
@@ -43,6 +51,15 @@ def _env_value(name: str, default: str = "") -> str:
     if value.startswith("请填写"):
         return ""
     return value
+
+
+def _sanitize_sdk_error(exc: BaseException) -> str:
+    """去掉 SDK 异常中可能携带的签名参数，避免把密钥信息返回给前端。"""
+
+    message = str(exc)
+    message = re.sub(r"AccessKeyId=[^&\s)]+", "AccessKeyId=***", message)
+    message = re.sub(r"Signature=[^&\s)]+", "Signature=***", message)
+    return message
 
 
 @dataclass(frozen=True)
@@ -130,7 +147,10 @@ class AliyunASRService:
         key = object_key or f"systemreq-copilot/{file_path.name}"
         auth = oss2.Auth(self.settings.aliyun_ak, self.settings.aliyun_sk)
         bucket = oss2.Bucket(auth, self.settings.oss_endpoint, self.settings.oss_bucket)
-        bucket.put_object_from_file(key, str(file_path))
+        self._call_with_retries(
+            "上传音频到 OSS",
+            lambda: bucket.put_object_from_file(key, str(file_path)),
+        )
 
         if self.settings.oss_public_base_url:
             return f"{self.settings.oss_public_base_url.rstrip('/')}/{key}"
@@ -236,7 +256,10 @@ class AliyunASRService:
         request.set_protocol_type("https")
         request.add_body_params("Task", json.dumps(task_payload, ensure_ascii=False))
 
-        raw_response = self.client.do_action_with_exception(request)
+        raw_response = self._call_with_retries(
+            "提交 ASR 任务",
+            lambda: self.client.do_action_with_exception(request),
+        )
         try:
             return json.loads(raw_response.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -254,8 +277,35 @@ class AliyunASRService:
         request.set_protocol_type("https")
         request.add_query_param("TaskId", task_id)
 
-        raw_response = self.client.do_action_with_exception(request)
+        raw_response = self._call_with_retries(
+            "查询 ASR 任务结果",
+            lambda: self.client.do_action_with_exception(request),
+        )
         try:
             return json.loads(raw_response.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ASRServiceError(f"阿里云响应解析失败：{raw_response!r}") from exc
+
+    def _call_with_retries(self, operation_name: str, operation: Callable[[], Any]) -> Any:
+        """对 OSS/ASR SDK 的短暂网络抖动做有限重试，并统一转成业务异常。"""
+
+        last_error: BaseException | None = None
+        retryable_errors = (
+            oss2.exceptions.OssError,
+            ClientException,
+            ServerException,
+            OSError,
+            TimeoutError,
+        )
+
+        for attempt in range(RETRY_ATTEMPTS):
+            try:
+                return operation()
+            except retryable_errors as exc:
+                last_error = exc
+                if attempt >= RETRY_ATTEMPTS - 1:
+                    break
+                time.sleep(RETRY_BACKOFF_SECONDS[min(attempt, len(RETRY_BACKOFF_SECONDS) - 1)])
+
+        detail = _sanitize_sdk_error(last_error) if last_error else "未知错误"
+        raise ASRServiceError(f"{operation_name}失败：{detail}") from last_error

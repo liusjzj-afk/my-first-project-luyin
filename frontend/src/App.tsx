@@ -144,8 +144,10 @@ function LibraryPage() {
 
   const refreshLibrary = async (mode = viewMode) => {
     try {
-      const [nextMeetings, nextStats] = await Promise.all([fetchMeetings(mode === "trash"), fetchStats()]);
-      setMeetings(nextMeetings);
+      const nextMeetings = await fetchMeetings(mode === "trash");
+      const refreshedMeetings = await refreshProcessingMeetings(nextMeetings);
+      const nextStats = await fetchStats();
+      setMeetings(refreshedMeetings);
       setStats(nextStats);
     } catch (error) {
       console.error(error);
@@ -186,8 +188,8 @@ function LibraryPage() {
       void refreshLibrary("list");
     } catch (error) {
       setUploadState("failed");
-      setUploadProgress(100);
-      setStatusText(error instanceof Error ? error.message : "上传失败");
+      setUploadProgress(0);
+      setStatusText(error instanceof Error ? `上传失败：${error.message}` : "上传失败");
     } finally {
       if (inputRef.current) inputRef.current.value = "";
     }
@@ -319,7 +321,7 @@ function UploadDropzone({
 }) {
   return (
     <div
-      className={`premium-upload ${isDragging ? "dragging" : ""}`}
+      className={`premium-upload ${isDragging ? "dragging" : ""} ${uploadState === "failed" ? "failed" : ""}`}
       onClick={() => inputRef.current?.click()}
       onDragOver={(event) => {
         event.preventDefault();
@@ -991,6 +993,39 @@ async function fetchMeetingStatus(meetingId: string): Promise<MeetingStatus> {
   const response = await fetch(`${API_BASE_URL}/api/meetings/${meetingId}/status`);
   if (!response.ok) throw new Error(await readError(response));
   return response.json();
+}
+
+async function refreshProcessingMeetings(meetings: MeetingListItem[]): Promise<MeetingListItem[]> {
+  const processingMeetings = meetings.filter(
+    (item) => item.asr_status === "PROCESSING" || item.asr_status === "SUMMARIZING"
+  );
+
+  if (!processingMeetings.length) return meetings;
+
+  const statuses = await Promise.all(
+    processingMeetings.map(async (item) => {
+      try {
+        return await fetchMeetingStatus(item.id);
+      } catch (error) {
+        console.error(error);
+        return null;
+      }
+    })
+  );
+  const statusById = new Map(statuses.filter((item): item is MeetingStatus => Boolean(item)).map((item) => [item.meeting_id, item]));
+
+  return meetings.map((item) => {
+    const status = statusById.get(item.id);
+    if (!status) return item;
+    return {
+      ...item,
+      asr_status: status.status,
+      duration_seconds: status.duration_seconds ?? item.duration_seconds,
+      audio_duration: status.audio_duration ?? item.audio_duration,
+      eta_seconds: status.eta_seconds,
+      progress_percent: status.progress_percent
+    };
+  });
 }
 
 async function mutateMeeting(path: string, method: "DELETE" | "POST") {
