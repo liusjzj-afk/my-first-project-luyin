@@ -11,11 +11,10 @@ import enum
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, ForeignKey, Integer, String, Text, create_engine, text
-from sqlalchemy.dialects.sqlite import JSON
+from sqlalchemy import JSON, DateTime, Enum, ForeignKey, Integer, String, Text, create_engine, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
-from config import get_settings
+from config import get_settings, is_sqlite_url
 
 # 需要用户填写或按需覆盖的环境变量：
 # DATABASE_URL=sqlite:///./systemreq_copilot.db
@@ -353,7 +352,7 @@ class UsageLog(Base):
 
 engine = create_engine(
     DATABASE_URL,
-    connect_args={"check_same_thread": False},
+    connect_args={"check_same_thread": False} if is_sqlite_url(DATABASE_URL) else {},
 )
 
 SessionLocal = sessionmaker(
@@ -373,10 +372,13 @@ def ensure_schema() -> None:
     """
     创建表并补齐本地 SQLite 轻量 schema 变更。
 
-    项目当前不引入 Alembic；对已有本地数据库只追加兼容字段。
+    生产数据库应使用 Alembic；这里仅对已有本地 SQLite 数据库追加兼容字段。
     """
 
     Base.metadata.create_all(bind=engine)
+    if not is_sqlite_url(DATABASE_URL):
+        return
+
     with engine.begin() as connection:
         columns = {
             row[1]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -155,3 +156,59 @@ def test_retry_summary_only_resets_llm_state(
     assert persisted.asr_task_id == "existing-asr-task"
     assert persisted.llm_status == LLMStatus.PENDING
     assert persisted.summary_content is None
+
+
+def test_legacy_upload_is_disabled_by_default(client: TestClient) -> None:
+    response = client.post(
+        "/api/meetings/upload",
+        files={"file": ("meeting.wav", b"audio", "audio/wav")},
+    )
+
+    assert response.status_code == 410
+    assert "OSS" in response.json()["detail"]
+
+
+def test_local_audio_stream_is_disabled_by_default(
+    client: TestClient,
+    db_session: Session,
+    tmp_path,
+) -> None:
+    audio_path = tmp_path / "private.wav"
+    audio_path.write_bytes(b"audio")
+    meeting = Meeting(
+        id="local-audio-disabled",
+        title="private.wav",
+        audio_file_path=str(audio_path),
+        upload_time=datetime.now(timezone.utc),
+        asr_status=ASRStatus.COMPLETED,
+        llm_status=LLMStatus.COMPLETED,
+        duration_seconds=1,
+        audio_duration=1,
+    )
+    db_session.add(meeting)
+    db_session.commit()
+
+    response = client.get("/api/meetings/local-audio-disabled/audio")
+
+    assert response.status_code == 410
+
+
+def test_trusted_header_auth_requires_identity(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import auth
+
+    monkeypatch.setattr(
+        auth,
+        "get_settings",
+        lambda: SimpleNamespace(
+            auth_mode="trusted_headers",
+            default_tenant_id="public",
+            default_user_id="local-user",
+        ),
+    )
+
+    response = client.get("/api/meetings/stats")
+
+    assert response.status_code == 401

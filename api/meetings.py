@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, Uplo
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 
+from auth import RequestContext, get_request_context
 from config import get_settings
 from media.audio import (
     content_disposition_header,
@@ -19,7 +20,7 @@ from media.audio import (
     parse_byte_range,
 )
 from models import ASRStatus, ChatHistory, ChatRole, LLMStatus, Meeting, SessionLocal, utc_now
-from repositories.meetings import RequestContext, get_meeting_for_context, get_request_context, query_meetings_for_context
+from repositories.meetings import get_meeting_for_context, query_meetings_for_context
 from schemas import (
     ActionResponse,
     ChatRequest,
@@ -107,6 +108,13 @@ def upload_meeting_audio(
 ) -> UploadMeetingResponse:
     """上传音频，保存本地文件，提交阿里云 ASR 任务并创建会议记录。"""
 
+    settings = get_settings()
+    if not settings.allow_legacy_upload:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="后端直传上传已禁用，请使用 OSS 直传上传",
+        )
+
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_AUDIO_EXTENSIONS:
         raise HTTPException(
@@ -114,7 +122,6 @@ def upload_meeting_audio(
             detail="仅支持 .mp3、.wav、.m4a、.mp4、.aac、.opus 音频文件",
         )
 
-    settings = get_settings()
     meeting_id = str(uuid.uuid4())
     safe_filename = Path(file.filename or f"meeting{suffix}").name
     settings.upload_dir.mkdir(parents=True, exist_ok=True)
@@ -212,11 +219,23 @@ def get_meeting_audio(
     """返回会议本地录音文件，供详情页播放器使用。"""
 
     meeting = _get_meeting_or_404(db, meeting_id, context)
-    if meeting.media_object_key and not meeting.audio_file_path:
+    settings = get_settings()
+    if meeting.media_object_key:
         try:
-            return Response(status_code=status.HTTP_307_TEMPORARY_REDIRECT, headers={"Location": ObjectStorageService().signed_get_url(meeting.media_object_key)})
+            return Response(
+                status_code=status.HTTP_307_TEMPORARY_REDIRECT,
+                headers={"Location": ObjectStorageService().signed_get_url(meeting.media_object_key)},
+            )
         except ASRServiceError as exc:
-            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+            if not settings.allow_local_audio_stream or not meeting.audio_file_path:
+                raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+    if not settings.allow_local_audio_stream:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="本地录音流已禁用，请使用签名播放地址",
+        )
+
     audio_path = Path(meeting.audio_file_path)
     if not audio_path.exists() or not audio_path.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="录音文件不存在")
@@ -439,11 +458,14 @@ def _meeting_list_item(meeting: Meeting) -> MeetingListItem:
 
 
 def _audio_url(meeting: Meeting) -> str | None:
+    settings = get_settings()
     if meeting.media_object_key:
         try:
             return ObjectStorageService().signed_get_url(meeting.media_object_key)
         except ASRServiceError:
-            return f"/api/meetings/{meeting.id}/audio"
-    if meeting.audio_file_path:
+            if settings.allow_local_audio_stream and meeting.audio_file_path:
+                return f"/api/meetings/{meeting.id}/audio"
+            return None
+    if meeting.audio_file_path and settings.allow_local_audio_stream:
         return f"/api/meetings/{meeting.id}/audio"
     return None

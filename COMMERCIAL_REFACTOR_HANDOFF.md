@@ -6,9 +6,11 @@
 
 商业化重构的主干架构已经落地，但还不是生产商业化上线完成态。
 
-当前已完成：去除 `GET /status` 副作用、后台任务边界、Celery/Redis 入口、双状态机、租户过滤、UsageLog/Transcript/Summary 数据底座、Alembic 骨架、OSS 直传/签名播放接口、SSE 状态推送接口、前端 SSE hook、前端大文件拆分、基础测试。
+当前已完成：去除 `GET /status` 副作用、后台任务边界、Celery/Redis 入口、双状态机、租户过滤、UsageLog/Transcript/Summary 数据底座、Alembic 骨架、OSS 直传/签名播放接口、旧 Web 节点大文件 IO 默认禁用、SSE 状态推送接口、前端 SSE hook、前端大文件拆分、基础测试。
 
-仍需完成：Redis/Celery/OSS 真实环境端到端联调、彻底废除旧后端上传/媒体流 fallback、真实认证鉴权、计费聚合、迁移脚本在真实库验证、生产部署配置。
+本轮继续完成：旧后端上传/本地媒体流已改为显式开关且默认禁用；租户上下文已从 repository 抽到统一认证依赖；生产可关闭启动时自动补 schema，数据库交给 Alembic；当前本地 SQLite 已执行 `alembic upgrade head` 并验证表结构；OSS 签名与 LLM 连通性已通过轻量检查。
+
+仍需完成：真实 Redis/Celery worker 环境端到端联调、真实登录/JWT/RBAC、计费聚合、生产数据库迁移演练、完整生产部署配置。
 
 ## 已完成的核心改造
 
@@ -109,9 +111,16 @@ repositories/meetings.py
 api/meetings.py
 models.py
 config.py
+auth.py
 ```
 
-当前租户上下文来自 header：
+当前租户上下文来自统一依赖：
+
+```text
+auth.py
+```
+
+开发模式仍可从 header 读取：
 
 ```http
 X-Tenant-Id
@@ -132,7 +141,21 @@ get_meeting_for_context(db, meeting_id, context)
 query_meetings_for_context(db, context)
 ```
 
-注意：这只是商业化多租户底座，还没有接入真实登录态、JWT、Session 或 RBAC。
+配置：
+
+```env
+AUTH_MODE=development
+```
+
+生产若由网关或认证代理注入可信身份，可设置：
+
+```env
+AUTH_MODE=trusted_headers
+```
+
+此时缺少 `X-Tenant-Id` 或 `X-User-Id` 会直接返回 401。
+
+注意：这仍不是完整登录态、JWT、Session 或 RBAC，只是把身份解析集中到一个入口，便于后续替换为真实鉴权。
 
 ### 5. 用量记录与计费底座
 
@@ -233,10 +256,17 @@ POST /api/upload/complete
 
 ```text
 优先直传 OSS
-失败则 fallback 到旧 POST /api/meetings/upload
+只有 VITE_ENABLE_LEGACY_UPLOAD_FALLBACK=true 时才 fallback 到旧 POST /api/meetings/upload
 ```
 
-注意：旧后端上传和本地媒体 Range 流仍保留，是为了本地开发兼容。商业化上线前应删除或封禁旧路径。
+后端旧路径当前由显式开关控制，默认禁用：
+
+```env
+ALLOW_LEGACY_UPLOAD=false
+ALLOW_LOCAL_AUDIO_STREAM=false
+```
+
+旧接口保留代码路径是为了必要时本地兼容，但商业化默认不会启用 Web 节点大文件 IO。
 
 ### 8. Celery + Redis 任务边界
 
@@ -271,7 +301,7 @@ CELERY_RESULT_BACKEND=redis://localhost:6379/1
 .venv/bin/celery -A celery_app.celery_app worker --loglevel=INFO
 ```
 
-注意：当前未在真实 Redis/Celery 环境做端到端验证。
+注意：当前机器未安装/运行 Redis，`redis://localhost:6379/0` 探测结果为 connection refused，因此仍未完成真实 Redis/Celery worker 端到端验证。
 
 ### 9. SSE 状态推送
 
@@ -370,13 +400,13 @@ load_summary_prompt(meeting_type)
 结果：
 
 ```text
-14 passed
+17 passed
 ```
 
 已执行并通过：
 
 ```bash
-.venv/bin/python -m py_compile main.py config.py models.py schemas.py api/meetings.py api/uploads.py services/asr_service.py services/llm_service.py services/meeting_processing.py services/object_storage.py services/events.py celery_app.py tasks/meetings.py repositories/meetings.py media/audio.py alembic/env.py alembic/versions/20260517_commercial_foundation.py
+.venv/bin/python -m py_compile main.py config.py models.py schemas.py auth.py api/meetings.py api/uploads.py services/asr_service.py services/llm_service.py services/meeting_processing.py services/object_storage.py services/events.py celery_app.py tasks/meetings.py repositories/meetings.py media/audio.py alembic/env.py alembic/versions/20260517_commercial_foundation.py
 ```
 
 已执行并通过：
@@ -390,6 +420,32 @@ npm run build
 
 - 前端构建通过。
 - 仍有 Mermaid 相关 chunk size warning，是既有依赖体积问题。
+
+已执行并通过：
+
+```bash
+.venv/bin/alembic upgrade head
+```
+
+本地 SQLite 验证结果：
+
+```text
+alembic_version=20260517_commercial_foundation
+tables=alembic_version,chat_histories,meetings,summaries,transcripts,usage_logs
+```
+
+已执行并通过轻量外部检查：
+
+```text
+OSS_SIGN_OK
+LLM_OK
+```
+
+Redis 探测结果：
+
+```text
+ConnectionError: Error 61 connecting to localhost:6379. Connection refused.
+```
 
 ## 当前测试覆盖
 
@@ -407,6 +463,9 @@ tests/test_media_audio.py
 - `GET /status` 不实例化 ASR/LLM，不写库。
 - 租户隔离：跨租户读会议返回 404。
 - `retry-summary` 只重置 LLM 状态，不重跑 ASR。
+- 旧后端上传默认返回 410。
+- 本地音频流默认返回 410。
+- `AUTH_MODE=trusted_headers` 缺身份时返回 401。
 - Range 解析。
 - 中文文件名 Content-Disposition。
 
@@ -442,19 +501,27 @@ ENABLE_CELERY=true
 - UsageLog 写入。
 - SSE 经 Redis Pub/Sub 推送到前端。
 
+当前状态：OSS 签名和 LLM 轻量检查通过；Redis/Celery 因本机无 Redis 服务未完成。
+
 ### P0：执行或验证 Alembic 迁移
 
-开发库可继续用 `ensure_schema()`，但生产需要：
+开发库可继续用 `ensure_schema()`，但生产建议设置：
+
+```env
+AUTO_ENSURE_SCHEMA=false
+```
+
+并使用：
 
 ```bash
 .venv/bin/alembic upgrade head
 ```
 
-需要在真实数据库上验证迁移脚本。
+当前已在本地 SQLite 执行成功；仍需要在生产同类型数据库上演练。
 
 ### P0：真实认证鉴权
 
-当前 `X-Tenant-Id` / `X-User-Id` 是占位实现。
+当前 `auth.py` 支持 `development` 和 `trusted_headers`，但真实用户认证仍未接入。
 
 商业化上线前必须接入：
 
@@ -472,12 +539,12 @@ POST /api/meetings/upload
 GET /api/meetings/{id}/audio
 ```
 
-旧路径用于本地兼容。
+旧路径用于必要时本地兼容，但默认禁用。
 
-商业化上线前应：
+商业化上线前若要彻底删除代码，应：
 
-- 禁用后端直接上传。
-- 禁用后端本地 Range 流。
+- 删除后端直接上传。
+- 删除后端本地 Range 流。
 - 全面使用 OSS/CDN 直传和签名播放。
 
 ### P1：计费系统
@@ -513,11 +580,11 @@ UsageLog 已有，但还缺：
 
 建议下一轮优先做：
 
-1. 真实 Redis + Celery + OSS 端到端联调。
+1. 安装/启动真实 Redis，完成 Celery worker + SSE Redis Pub/Sub 端到端联调。
 2. 修复联调发现的问题。
-3. 跑 Alembic 迁移并验证本地现有 SQLite 数据兼容。
-4. 将旧上传/旧媒体流改成显式 fallback 开关。
-5. 接入真实鉴权前，至少把租户 header 封装成中间件或 dependency，避免散落。
+3. 在生产同类型数据库上跑 Alembic 迁移演练。
+4. 接入真实登录/JWT/RBAC，替换 `auth.py` 当前可信 header 模式。
+5. 开始计费聚合：价格表、月账单、套餐额度和用量查询 API。
 
 可以直接引用这份文件：
 

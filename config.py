@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlparse
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -19,10 +20,13 @@ class Settings(BaseSettings):
 
     # 数据库
     database_url: str = "sqlite:///./systemreq_copilot.db"
+    auto_ensure_schema: bool = True
 
     # 文件上传
     upload_dir: Path = Path("./uploads")
     max_upload_size_mb: int = 100
+    allow_legacy_upload: bool = False
+    allow_local_audio_stream: bool = False
 
     # LLM：兼容 OpenAI SDK 格式的接口
     # 需要用户填写：
@@ -41,6 +45,7 @@ class Settings(BaseSettings):
     celery_result_backend: str = "redis://localhost:6379/1"
 
     # 多租户占位：未接入鉴权前使用默认租户，后续由认证中间件注入。
+    auth_mode: str = "development"
     default_tenant_id: str = "public"
     default_user_id: str = "local-user"
 
@@ -54,3 +59,8 @@ def get_settings() -> Settings:
     """缓存配置，避免每次请求重复读取 .env。"""
 
     return Settings()
+
+
+def is_sqlite_url(database_url: str) -> bool:
+    parsed = urlparse(database_url)
+    return parsed.scheme.startswith("sqlite")

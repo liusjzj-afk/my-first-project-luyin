@@ -7,9 +7,9 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
+from auth import RequestContext, get_request_context
 from api.meetings import ALLOWED_AUDIO_EXTENSIONS, get_db
 from models import ASRStatus, LLMStatus, Meeting
-from repositories.meetings import RequestContext, get_request_context
 from schemas import (
     PresignedUploadCompleteRequest,
     PresignedUploadCompleteResponse,

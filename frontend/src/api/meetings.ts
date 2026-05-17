@@ -1,11 +1,13 @@
 import type { MeetingListItem, MeetingStats, MeetingStatus } from "../types/meeting";
 
 export const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
+const ENABLE_LEGACY_UPLOAD_FALLBACK = import.meta.env.VITE_ENABLE_LEGACY_UPLOAD_FALLBACK === "true";
 
 export async function uploadMeeting(file: File): Promise<{ meeting_id: string }> {
   try {
     return await directUploadMeeting(file);
   } catch (error) {
+    if (!ENABLE_LEGACY_UPLOAD_FALLBACK) throw error;
     console.warn("Direct upload failed, falling back to backend upload", error);
   }
 

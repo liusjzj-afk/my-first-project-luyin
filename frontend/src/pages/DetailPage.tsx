@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { ArrowLeft, FileText, MessageSquareText, Network } from "lucide-react";
-import { resolveApiUrl, sendMeetingChat, API_BASE_URL, retryMeetingSummary } from "../api/meetings";
+import { resolveApiUrl, sendMeetingChat, retryMeetingSummary } from "../api/meetings";
 import { AgentSidebar } from "../components/AgentSidebar";
 import { MarkdownDocument } from "../components/MarkdownDocument";
 import { StatusBadge } from "../components/StatusBadge";
@@ -24,7 +24,7 @@ export function DetailPage() {
   const canChat = meeting?.status === "COMPLETED" && transcript.length > 0;
   const summary = meeting?.summary_content || meeting?.summary_markdown || "";
   const ia = meeting?.ia_content || "## 暂无信息架构\n\n当前会议尚未生成信息架构与优先级内容。";
-  const audioUrl = meeting?.audio_url ? resolveApiUrl(meeting.audio_url) : meetingId ? `${API_BASE_URL}/api/meetings/${meetingId}/audio` : "";
+  const audioUrl = meeting?.audio_url ? resolveApiUrl(meeting.audio_url) : "";
   const canRetrySummary = meeting?.asr_status === "COMPLETED" && meeting?.llm_status === "FAILED";
 
   const sendMessage = async () => {

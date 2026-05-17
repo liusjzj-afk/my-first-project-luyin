@@ -36,7 +36,8 @@ def on_startup() -> None:
 
     settings = get_settings()
     settings.upload_dir.mkdir(parents=True, exist_ok=True)
-    ensure_schema()
+    if settings.auto_ensure_schema:
+        ensure_schema()
     resume_incomplete_meetings()
 
 
