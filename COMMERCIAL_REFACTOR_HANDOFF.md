@@ -8,9 +8,9 @@
 
 当前已完成：去除 `GET /status` 副作用、后台任务边界、Celery/Redis 入口、双状态机、租户过滤、UsageLog/Transcript/Summary 数据底座、Alembic 骨架、OSS 直传/签名播放接口、旧 Web 节点大文件 IO 默认禁用、SSE 状态推送接口、前端 SSE hook、前端大文件拆分、基础测试。
 
-本轮继续完成：旧后端上传/本地媒体流已改为显式开关且默认禁用；租户上下文已从 repository 抽到统一认证依赖；生产可关闭启动时自动补 schema，数据库交给 Alembic；当前本地 SQLite 已执行 `alembic upgrade head` 并验证表结构；OSS 签名与 LLM 连通性已通过轻量检查。
+本轮继续完成：旧后端上传/本地媒体流已改为显式开关且默认禁用；租户上下文已从 repository 抽到统一认证依赖；生产可关闭启动时自动补 schema，数据库交给 Alembic；当前本地 SQLite 已执行 `alembic upgrade head` 并验证表结构；Redis/Celery/OSS/ASR/LLM/UsageLog/SSE 已完成本地端到端联调。
 
-仍需完成：真实 Redis/Celery worker 环境端到端联调、真实登录/JWT/RBAC、计费聚合、生产数据库迁移演练、完整生产部署配置。
+仍需完成：真实登录/JWT/RBAC、计费聚合、生产数据库迁移演练、完整生产部署配置。
 
 ## 已完成的核心改造
 
@@ -301,7 +301,13 @@ CELERY_RESULT_BACKEND=redis://localhost:6379/1
 .venv/bin/celery -A celery_app.celery_app worker --loglevel=INFO
 ```
 
-注意：当前机器未安装/运行 Redis，`redis://localhost:6379/0` 探测结果为 connection refused，因此仍未完成真实 Redis/Celery worker 端到端验证。
+当前已在本机 Redis 上完成 Celery worker 联调：
+
+- Worker 连接 `redis://localhost:6379/9` 成功。
+- 新上传任务由 Web 入队，Worker 消费 `meetings.process`。
+- ASR 完成后继续调用 LLM 生成 summary。
+- `UsageLog` 写入 ASR 与 LLM 两类用量。
+- SSE 在 `ENABLE_CELERY=true` 下通过 Redis Pub/Sub 推送状态事件。
 
 ### 9. SSE 状态推送
 
@@ -441,10 +447,17 @@ OSS_SIGN_OK
 LLM_OK
 ```
 
-Redis 探测结果：
+Redis/Celery 端到端验证结果：
 
 ```text
-ConnectionError: Error 61 connecting to localhost:6379. Connection refused.
+redis-cli ping -> PONG
+Worker Connected to redis://localhost:6379/9
+POST /api/upload/complete -> 200
+meetings.process -> succeeded
+status=COMPLETED, asr_status=COMPLETED, llm_status=COMPLETED
+UsageLog: ASR 211 seconds
+UsageLog: LLM 5509 total_tokens
+SSE events: PROCESSING -> COMPLETED
 ```
 
 ## 当前测试覆盖
@@ -501,7 +514,7 @@ ENABLE_CELERY=true
 - UsageLog 写入。
 - SSE 经 Redis Pub/Sub 推送到前端。
 
-当前状态：OSS 签名和 LLM 轻量检查通过；Redis/Celery 因本机无 Redis 服务未完成。
+当前状态：已完成本地真实 Redis + Celery + OSS + ASR + LLM + UsageLog + SSE 端到端联调。测试使用独立临时数据库 `celery_e2e.db` 和 Redis DB 9/10，联调后已清理。
 
 ### P0：执行或验证 Alembic 迁移
 
@@ -580,11 +593,11 @@ UsageLog 已有，但还缺：
 
 建议下一轮优先做：
 
-1. 安装/启动真实 Redis，完成 Celery worker + SSE Redis Pub/Sub 端到端联调。
-2. 修复联调发现的问题。
-3. 在生产同类型数据库上跑 Alembic 迁移演练。
-4. 接入真实登录/JWT/RBAC，替换 `auth.py` 当前可信 header 模式。
-5. 开始计费聚合：价格表、月账单、套餐额度和用量查询 API。
+1. 在生产同类型数据库上跑 Alembic 迁移演练。
+2. 接入真实登录/JWT/RBAC，替换 `auth.py` 当前可信 header 模式。
+3. 开始计费聚合：价格表、月账单、套餐额度和用量查询 API。
+4. 补生产部署配置：Web、Worker、Redis、对象存储、环境变量、日志与健康检查。
+5. 前端继续产品化：上传阶段展示、Library 页轻量事件刷新、LLM 失败态细化。
 
 可以直接引用这份文件：
 
